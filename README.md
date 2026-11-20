@@ -1,6 +1,6 @@
 # Ladder Hedge
 
-Live demo: <!-- DEPLOY_URL -->
+Live demo: https://ladder-hedge.vercel.app
 
 Repository: https://github.com/Lyton505/ladder-hedge (default branch `build`)
 
@@ -12,7 +12,7 @@ The single claim: **for the chosen ladder, quotes and floor, this is the lowest-
 
 What it does not claim:
 
-- It never claims profit. A hedge costs money. Because it buys at the ask and pays a fee, its expected payout at mid-market implied probabilities is normally below its cost (see the worked example), and the app shows that net expected cost.
+- It never claims profit. A hedge costs money. Because it buys at the ask and pays a fee, its expected payout at mid-market implied probabilities is normally below its cost (see the worked example). The app leads with that net expected cost and shows the up-front outlay, which is what actually leaves the account, directly beneath it.
 - It does not protect below the ladder's lowest strike. Below that strike the basket pays a fixed amount and every further dollar of decline is the holder's loss again.
 - It does not protect before expiry. The contracts settle once; their value in between moves with the market.
 - It places no orders. Execution is simulated ("paper"); the on-chain receipt records a plan, not a trade.
@@ -166,7 +166,7 @@ Inside the linear programs a contract costs `price + rate x price x (1 - price)`
 Solved with [yalps](https://www.npmjs.com/package/yalps), a simplex solver written in TypeScript.
 
 1. **Stage 1, minimum cost.** Minimise total cost subject to, in every state j, `unhedged_j + payout_j - totalCost >= -maxLoss`, and the leg caps. Cost appears inside every state's constraint, not only in the objective, so the hedge has to pay for itself within the floor.
-2. **Stage 2, best reachable worst case.** Used only when stage 1 is infeasible. It first finds the best worst case t* the legs and caps allow, then returns the cheapest plan whose worst case is within 0.1% of position value of t*. Without that second step the pure maximin plan can spend dollars on near-certain contracts to gain fractions of a cent.
+2. **Stage 2, best reachable worst case.** Used only when stage 1 is infeasible. It first finds the best worst case t* the legs and caps allow, then returns the cheapest plan whose worst case is within a small slack of t*: the smaller of 0.1% of position value and 5% of the achievable improvement (t* minus the unhedged worst case). Without that second step the pure maximin plan can spend dollars on near-certain contracts to gain fractions of a cent.
 
 If the unhedged worst case already meets the floor, neither program runs.
 
@@ -233,7 +233,7 @@ The engine also rejects malformed ladders before solving: strikes must be strict
 7. **Fees follow Gemini's published formula, which can change.** The rate is an input (default 0.07). Fees are computed per leg as one order; if an order filled in several pieces, cent rounding could differ slightly.
 8. **Execution is simulated.** "Paper fill" saves the plan in the browser's local storage and records a receipt. No order is sent to Gemini.
 9. **Devnet only, as deployed.** The default and only exercised cluster is Solana devnet, where SOL has no value; the wallet balance stands in for a real holding. The cluster is an environment setting.
-10. **Implied probabilities are market prices, not forecasts.** They are mids with simple rules for one-sided and unquoted rungs, smoothed to be consistent. They inform the expected-payout figure only.
+10. **Implied probabilities are market prices, not forecasts.** They are mids with simple rules for one-sided and unquoted rungs, smoothed to be consistent. They inform the expected payout, and so the net expected cost in the headline, and nothing else; the hedge itself is chosen on executable prices.
 11. **Long holdings only.** The engine rejects a negative quantity; short exposure is not modelled.
 12. **Venue risk is not modelled.** The plan assumes Gemini settles its contracts as specified.
 
@@ -252,7 +252,7 @@ The id is set in `src/lib/solana/constants.ts` and was checked against the SPL d
 1. **Wallet.** Connects any Wallet Standard wallet (for example Phantom or Solflare) through `@solana/wallet-adapter-react`, with no hard-coded adapters.
 2. **Exposure.** Reads the connected wallet's SOL balance (`getBalance` at `confirmed`) and offers it as the quantity to hedge.
 3. **Receipt write.** "Paper fill and record receipt" builds a one-instruction transaction calling the Memo program, with the wallet as the instruction's only key, marked as signer, so the Memo program checks the signature and logs the signer. The wallet signs and sends it; the app waits for `confirmed` and links the signature to Solana Explorer.
-4. **Receipt read.** Reads the wallet's recent transactions with `getSignaturesForAddress`, keeps those whose memo starts with `LH1|`, and matches them to locally saved paper fills by plan hash.
+4. **Receipt read.** Reads the wallet's 50 most recent transactions with `getSignaturesForAddress` (`src/hooks/use-hedge-receipts.ts`), keeps the successful ones whose memo starts with `LH1|`, and lists them. A receipt is marked "Hash verified" when its event ticker and its 32-hex plan-hash prefix match a paper fill saved in the same browser (`matchVerifiedSignatures` in `src/lib/client/workbench-model.ts`); the full plan hash is never on chain.
 
 **Receipt format.** The plan is serialised to canonical JSON (fixed key order, legs sorted, numbers rounded to 6 decimals, no whitespace) and hashed with SHA-256. The memo is pipe-delimited and under 300 bytes:
 
@@ -262,7 +262,11 @@ LH1|{eventTicker}|q={quantity}|floor={maxLoss}|cost={totalCost, 2 decimals}|legs
 
 For the worked example: `LH1|SOL-FIXTURE|q=10|floor=10|cost=2.60|legs=4|h=92f33be1954735bedb66cbd2026fab64`. Anyone holding the plan can recompute the hash and compare it with the memo; the memo alone shows the size, floor and cost that were committed.
 
-**Status.** <!-- UPDATE AFTER WALLET TEST --> The receipt transaction has been simulated successfully on devnet (the Memo program executed and logged the `LH1|` memo), but a signed, confirmed write from a browser wallet has not yet been verified end to end. The read path was checked against existing devnet Memo transactions.
+**Status.** One signed receipt has been verified end to end: on 2026-11-20 a browser wallet on the deployed site (https://ladder-hedge.vercel.app) signed and sent it, and it is finalized on Solana devnet with no error. The page then read it back from chain and showed "Hash verified" against the locally saved fill (5 SOL, 54.38 contracts for $17.16, worst case -$5.44). That is one receipt, on devnet, from one wallet.
+
+- Signature: `3xDCJ7zKM9Wk83NCuFq9NKa7y2gdpJY5kiPL3FRR6ze5xrJE84KYXTnbGURDa9BFd9TXZt1LePm6vsrxnUrzctz9`
+- Explorer: https://explorer.solana.com/tx/3xDCJ7zKM9Wk83NCuFq9NKa7y2gdpJY5kiPL3FRR6ze5xrJE84KYXTnbGURDa9BFd9TXZt1LePm6vsrxnUrzctz9?cluster=devnet
+- Memo as stored on chain: `LH1|SOL2611202200|q=5|floor=5.439825|cost=17.16|legs=11|h=236b0a26fe9c17bef890b09675f90189`
 
 ## How it uses the Gemini Prediction Markets API
 
@@ -303,15 +307,17 @@ Browser (Next.js client components)                  Server (Next.js route handl
         Solana Explorer link for each receipt signature
 ```
 
-<!-- CHECK AFTER TASK 6: the paragraph below and "Page behaviour" describe the integration task's specification. -->
-
-Data flow for one plan: the page lists ladders for the chosen asset, loads one ladder (live with sizes, or a snapshot) and the spot price, and runs the engine in the browser whenever an input changes: price states, the linear programs, the payoff curve, the largest hedgeable position and the consistency check. Paper fill builds the memo, saves the fill locally without a signature, then asks the wallet to sign the receipt and stores the signature on success. If the wallet is missing, the user rejects, or the RPC fails, the fill stays saved without a signature and the error is shown.
+Data flow for one plan: the page lists ladders for the chosen asset, loads one ladder (live with sizes, or a snapshot) and the spot price (Gemini's ticker for a live ladder, the spot captured with it for a snapshot), and runs the engine in the browser. When an input changes it recomputes the price states, the linear programs and the payoff curve (following a deferred copy of the inputs, so a slider drag stays responsive); the consistency check reruns when the ladder or fee rate changes; the largest hedgeable position runs once the inputs have been still for 350 ms. The engine is not called while the quantity is blank or not above zero, or while spot is missing; the page shows a prompt or the loading or spot-error state instead. Any error the engine throws is caught and shown as a message in place of the plan (or in the consistency panel, or under the largest hedgeable position). Paper fill builds the memo from the request the displayed plan was computed from, saves the fill locally without a signature, then, if a wallet is connected, asks it to sign the receipt and stores the signature on success. With no wallet the fill is saved and the page says no receipt was written; if the user rejects or the RPC fails, the fill stays saved without a signature and the error is shown.
 
 ### Page behaviour
 
-- Starts on SOL and picks the live, unexpired ladder with the most two-sided rungs (hourly ladders are often thin), falling back to a snapshot. Assets offered: SOL, BTC, ETH, XRP (snapshots exist for SOL, BTC and ETH).
-- Quantity defaults to the wallet's SOL balance when one is connected, otherwise 10. The floor is set as a share of position value (default 1.5%, slider from 0.25% to 10%), the fee rate defaults to 7%, and the assumed depth to 100 contracts.
-- Live ladders refresh every 15 seconds while the tab is visible, and the fetch time is shown.
+- Starts on SOL and picks the live, unexpired ladder with the most two-sided rungs, provided it has at least 3 (ties go to the later expiry; hourly ladders are often thin), falling back to a snapshot. Assets offered: SOL, BTC, ETH, XRP (snapshots exist for SOL, BTC and ETH).
+- Quantity is what the user typed, else the connected wallet's SOL balance (SOL only, when above zero), else 10. The floor is set as a share of position value (default 1.5%, slider from 0.25% to 10%), the fee rate defaults to 7%, and the assumed depth to 100 contracts.
+- The headline shows three figures: worst case without the hedge, worst case with it, and the net expected cost (up-front cost minus the expected payout at the ladder's own market-implied probabilities, which is not a forecast). The up-front cost, fees included, and the expected payout are shown directly beneath it.
+- Below the payoff chart: the largest position hedgeable at this floor (with whether it rests on measured or assumed depth, or "Any size" when no position needs a hedge at this floor) and the time to expiry. Under the legs table, one line says whether the plan's size limits are measured, assumed or mixed.
+- Notices above the plan cover snapshot data, an expired ladder, spot below the lowest strike or above the highest strike, and a failed ladder or spot refresh (the last data is kept and its time shown). A permanent "What this hedge does not do" box states expiry-only protection, no protection below the lowest strike, settlement reference versus spot, simulated fills and no promise of profit.
+- "Paper fill and record receipt" is disabled while the plan is updating, for an expired ladder, or when the plan buys nothing.
+- Live ladders and spot refresh every 15 seconds while the tab is visible, and the fetch time is shown; the ladder list refreshes every 60 seconds.
 - `/preview` renders every component with fixed sample data.
 
 ### Directory layout
@@ -320,11 +326,15 @@ Data flow for one plan: the page lists ladders for the chosen asset, loads one l
 src/
   app/
     page.tsx, layout.tsx            page and root layout
+    error.tsx                       fallback shown if the page fails to render
     preview/page.tsx                components with sample data
     api/ladders/route.ts            GET /api/ladders
     api/ladders/[ticker]/route.ts   GET /api/ladders/{ticker}
     api/spot/route.ts               GET /api/spot
   lib/
+    client/                         browser fetch helpers for the routes; pure page
+                                    decisions (default ladder, depth basis, spot
+                                    notices, receipt matching)
     hedge/                          engine: types, validation, price states, implied
                                     distribution, optimiser, coherence, payoff curve,
                                     test fixture
@@ -400,7 +410,7 @@ It prints the throwaway address; fund it at https://faucet.solana.com within the
 - **Top of book only.** Each leg is priced at the best quote and capped at the size there. Deeper levels, which would allow larger hedges at worse prices, are not used.
 - **Snapshots have no sizes,** so on a snapshot every cap is the assumed depth.
 - **Rounding costs a little.** The repair that keeps rounded plans above the floor raises the floor uniformly and in growing steps, so an `optimal` plan can cost slightly more than the true rounded minimum; in an independent review against a separate solver the median excess was under one cent. Very rarely a floor reachable before rounding (by under 1.5 cents) is reported as `best-effort`.
-- **`best-effort` trades a little protection for cost.** It returns the cheapest plan within 0.1% of position value of the best reachable worst case, so its worst case can sit up to that much below the true maximum. Its gross outlay can still be large near the feasibility limit (see the 1% row above).
+- **`best-effort` trades a little protection for cost.** It returns the cheapest plan whose worst case is within the smaller of 0.1% of position value and 5% of the achievable improvement of the best reachable worst case, so its worst case can sit up to that much below the true maximum. Its gross outlay can still be large near the feasibility limit (see the 1% row above).
 - **Static hedge.** No rebalancing, no early exit, and no mark-to-market view before expiry.
 - **The stress price is the default** described above. The engine accepts another value, but the page does not expose it.
 - **One expiry at a time.** Ladders with different expiries are not combined.
