@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseLadder } from "@/lib/gemini/parse-ladder";
 import {
+  BEST_EFFORT_LIFT_SLACK_FRACTION,
   BEST_EFFORT_SLACK_FRACTION,
   FLOOR_TOLERANCE,
   GEMINI_TAKER_FEE_RATE,
@@ -17,10 +18,14 @@ import {
 } from "@/lib/hedge/test-fixtures";
 import type { HedgePlan, HedgeRequest, Ladder, LadderRung } from "@/lib/hedge/types";
 import btcEvent from "../../../fixtures/gemini/btc-2611200500.json";
+import btcDailyEvent from "../../../fixtures/gemini/btc-2611202200.json";
 import solEvent from "../../../fixtures/gemini/sol-2611202200.json";
 
 /** Spot recorded with the BTC2611200500 snapshot (fixtures/gemini/snapshot-meta.json). */
 const BTC_SNAPSHOT_SPOT = 61497.87;
+
+/** Spot recorded with the BTC2611202200 snapshot (fixtures/gemini/snapshot-meta.json). */
+const BTC_DAILY_SNAPSHOT_SPOT = 61414.085;
 
 /** Spot recorded with the default SOL2611202200 snapshot (fixtures/gemini/snapshot-meta.json). */
 const SOL_SNAPSHOT_SPOT = 71.8915;
@@ -48,11 +53,14 @@ function fixtureRequest(overrides: Partial<HedgeRequest> = {}): HedgeRequest {
  * and that the reported worst case is the minimum hedged outcome.
  *
  * @param {HedgePlan} plan - The plan to check.
+ * @param {number} [tolerance] - Allowed snapping error in dollars; defaults to 1e-9 (right for positions under $1,000).
  * @returns {void}
  */
-function expectConsistentOutcomes(plan: HedgePlan): void {
+function expectConsistentOutcomes(plan: HedgePlan, tolerance = 1e-9): void {
   plan.outcomes.forEach((outcome) => {
-    expect(Math.abs(outcome.hedgedPnl - (outcome.unhedgedPnl + outcome.hedgePayout - plan.totalCost))).toBeLessThan(1e-9);
+    expect(Math.abs(outcome.hedgedPnl - (outcome.unhedgedPnl + outcome.hedgePayout - plan.totalCost))).toBeLessThan(
+      tolerance,
+    );
   });
   const minimum = Math.min(...plan.outcomes.map((outcome) => outcome.hedgedPnl));
   expect(Math.abs(plan.worstCaseAfter - minimum)).toBeLessThan(1e-9);
@@ -368,6 +376,41 @@ describe("best-effort plans at tight floors", () => {
   it("exports the best-effort slack as 0.1 percent of position value", () => {
     expect(BEST_EFFORT_SLACK_FRACTION).toBe(0.001);
   });
+
+  it("exports the lift slack as 5 percent of the achievable improvement", () => {
+    expect(BEST_EFFORT_LIFT_SLACK_FRACTION).toBe(0.05);
+  });
+
+  it("keeps 95 percent of a small achievable improvement cheaply (BTC snapshot, 1 BTC, depth 10, 0.5 percent)", () => {
+    const ladder = parseLadder(btcDailyEvent, "snapshot", "2026-11-20T05:09:28Z", BTC_DAILY_SNAPSHOT_SPOT);
+    expect(ladder).not.toBeNull();
+    if (ladder === null) {
+      return;
+    }
+    const request: HedgeRequest = {
+      ladder,
+      exposure: { asset: "BTC", quantity: 1, spot: BTC_DAILY_SNAPSHOT_SPOT },
+      maxLoss: 0.005 * BTC_DAILY_SNAPSHOT_SPOT,
+      stressPrice: null,
+      takerFeeRate: GEMINI_TAKER_FEE_RATE,
+      assumedDepth: 10,
+    };
+    const plan = optimizeHedge(request);
+    const bestWorstCase = bestAchievableWorstCase(request);
+    const lift = bestWorstCase - plan.worstCaseBefore;
+
+    expect(plan.status).toBe("best-effort");
+    // Here lift (about $26.88) is below 0.1 percent of value ($61.41), so the lift term sets the slack.
+    expect(lift).toBeLessThan(BEST_EFFORT_SLACK_FRACTION * BTC_DAILY_SNAPSHOT_SPOT);
+    // The pure maximin plan cost $93.17 for a worst case of -1387.26 (re-review N1).
+    expect(plan.totalCost).toBeLessThan(50);
+    expect(plan.worstCaseAfter).toBeLessThanOrEqual(bestWorstCase + FLOOR_TOLERANCE);
+    expect(plan.worstCaseAfter).toBeGreaterThanOrEqual(
+      bestWorstCase - BEST_EFFORT_LIFT_SLACK_FRACTION * lift - FLOOR_TOLERANCE,
+    );
+    expect(plan.worstCaseAfter).toBeGreaterThan(plan.worstCaseBefore);
+    expectConsistentOutcomes(plan, 1e-6);
+  });
 });
 
 describe("reported numbers", () => {
@@ -381,6 +424,20 @@ describe("reported numbers", () => {
       expect(Number(outcome.hedgedPnl.toFixed(9))).toBe(outcome.hedgedPnl);
       expect(Number(outcome.unhedgedPnl.toFixed(9))).toBe(outcome.unhedgedPnl);
     });
+  });
+
+  it("snaps relative to position size, so a million units reads cleanly", () => {
+    const plan = optimizeHedge(
+      fixtureRequest({ exposure: { ...SOL_FIXTURE_EXPOSURE, quantity: 1e6 }, maxLoss: 0, takerFeeRate: 0.07, assumedDepth: 100 }),
+    );
+    // Position value is about $72 million, so figures are snapped to 1e-4 (12 significant digits).
+    expect(plan.worstCaseBefore).toBe(-5120000);
+    expect(Number(plan.worstCaseAfter.toFixed(4))).toBe(plan.worstCaseAfter);
+    plan.outcomes.forEach((outcome) => {
+      expect(Number(outcome.hedgedPnl.toFixed(4))).toBe(outcome.hedgedPnl);
+      expect(Number(outcome.unhedgedPnl.toFixed(4))).toBe(outcome.unhedgedPnl);
+    });
+    expectConsistentOutcomes(plan, 1e-3);
   });
 });
 
@@ -397,6 +454,27 @@ describe("input validation", () => {
     expect(() => optimizeHedge(fixtureRequest({ ladder }))).toThrow(RangeError);
     expect(() => optimizeHedge(fixtureRequest({ ladder }))).toThrow(new RegExp(`strike 70\\): ${field} must be`));
     expect(() => maxHedgeableQuantity(fixtureRequest({ ladder, assumedDepth: 50 }), 0.02)).toThrow(RangeError);
+  });
+
+  it("rejects a zero or negative quantity or spot with a RangeError", () => {
+    [0, -1].forEach((value) => {
+      expect(() => optimizeHedge(fixtureRequest({ exposure: { ...SOL_FIXTURE_EXPOSURE, quantity: value } }))).toThrow(
+        /quantity must be a finite positive number/,
+      );
+      expect(() => optimizeHedge(fixtureRequest({ exposure: { ...SOL_FIXTURE_EXPOSURE, spot: value } }))).toThrow(
+        /spot must be a finite positive price/,
+      );
+      expect(() =>
+        maxHedgeableQuantity(fixtureRequest({ exposure: { ...SOL_FIXTURE_EXPOSURE, spot: value }, assumedDepth: 50 }), 0.02),
+      ).toThrow(RangeError);
+    });
+  });
+
+  it("evaluates a holder whose spot is under one strike gap at a stress price of zero", () => {
+    const plan = optimizeHedge(fixtureRequest({ exposure: { ...SOL_FIXTURE_EXPOSURE, spot: 0.5 }, maxLoss: 0 }));
+    expect(plan.stressPrice).toBe(0);
+    // Losing the whole position: 10 * (0 - 0.5) = -5.
+    expect(plan.worstCaseBefore).toBe(-5);
   });
 
   it("rejects non-finite exposure and loss values", () => {
@@ -486,7 +564,7 @@ function randomRequest(random: () => number): HedgeRequest {
   }
   const ladder: Ladder = { ...SOL_FIXTURE_LADDER, eventTicker: "RAND", rungs };
   const spot = baseStrike + (random() * (rungCount + 1) - 0.5) * spacing;
-  const quantity = Math.round(random() * 200) / 10;
+  const quantity = Math.max(0.1, Math.round(random() * 200) / 10);
   const worstExposure = Math.max(0, quantity * (spot - (baseStrike - spacing)));
   return {
     ladder,
@@ -532,10 +610,12 @@ describe("optimizeHedge randomized properties", () => {
       const context = `trial ${trial}: ${JSON.stringify({ request, plan: { status: plan.status, legs: plan.legs } })}`;
       statusCounts[plan.status] = (statusCounts[plan.status] ?? 0) + 1;
 
+      // Reported P&L is snapped to 12 significant digits of position value: allow that much.
+      const snapTolerance = 1e-9 + 1e-11 * request.exposure.quantity * request.exposure.spot;
       expect(plan.outcomes, context).toHaveLength(request.ladder.rungs.length + 1);
       plan.outcomes.forEach((outcome) => {
         const unhedged = request.exposure.quantity * (outcome.evalPrice - request.exposure.spot);
-        expect(Math.abs(outcome.unhedgedPnl - unhedged), context).toBeLessThan(1e-9);
+        expect(Math.abs(outcome.unhedgedPnl - unhedged), context).toBeLessThan(snapTolerance);
         const payout = plan.legs
           .filter((leg) => legPaysAtPrice(leg.side, leg.strike, outcome.evalPrice))
           .reduce((total, leg) => total + leg.quantity, 0);
@@ -543,9 +623,9 @@ describe("optimizeHedge randomized properties", () => {
         expect(
           Math.abs(outcome.hedgedPnl - (outcome.unhedgedPnl + outcome.hedgePayout - plan.totalCost)),
           context,
-        ).toBeLessThan(1e-9);
+        ).toBeLessThan(snapTolerance);
       });
-      expectConsistentOutcomes(plan);
+      expectConsistentOutcomes(plan, snapTolerance);
 
       plan.legs.forEach((leg) => {
         const rung = request.ladder.rungs.find((candidate) => candidate.strike === leg.strike);

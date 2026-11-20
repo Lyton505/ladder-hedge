@@ -2,6 +2,7 @@ export { checkCoherence } from "@/lib/hedge/coherence";
 export { impliedDistribution, medianStrikeGap } from "@/lib/hedge/implied-distribution";
 export { assertValidLadder } from "@/lib/hedge/ladder-validation";
 export {
+  BEST_EFFORT_LIFT_SLACK_FRACTION,
   BEST_EFFORT_SLACK_FRACTION,
   FLOOR_TOLERANCE,
   GEMINI_TAKER_FEE_RATE,

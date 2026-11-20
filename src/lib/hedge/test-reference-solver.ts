@@ -68,8 +68,8 @@ function referenceGap(strikes: number[]): number {
 
 /**
  * Builds the reference model from the plan's definitions, including the
- * stress rule from fix round 1: the requested stress price, else the lower of
- * (lowest strike - gap) and (spot - gap).
+ * stress rule from fix rounds 1 and 2: the requested stress price, else the
+ * lower of (lowest strike - gap) and max(0, spot - gap).
  *
  * @param {HedgeRequest} request - The request.
  * @returns {ReferenceModel} The model.
@@ -77,7 +77,7 @@ function referenceGap(strikes: number[]): number {
 export function buildReferenceModel(request: HedgeRequest): ReferenceModel {
   const strikes = request.ladder.rungs.map((rung) => rung.strike);
   const gap = referenceGap(strikes);
-  const stress = request.stressPrice ?? Math.min(strikes[0] - gap, request.exposure.spot - gap);
+  const stress = request.stressPrice ?? Math.min(strikes[0] - gap, Math.max(0, request.exposure.spot - gap));
   const evalPrices = [stress, ...strikes];
   const unhedged = evalPrices.map((price) => request.exposure.quantity * (price - request.exposure.spot));
   const legs: ReferenceLeg[] = [];

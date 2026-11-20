@@ -15,6 +15,12 @@ describe("resolveStressPrice", () => {
   it("uses a supplied stress price as given", () => {
     expect(resolveStressPrice(SOL_FIXTURE_LADDER, { ...SOL_FIXTURE_EXPOSURE, spot: 60 }, 64)).toBe(64);
   });
+
+  it("never goes below zero when spot is smaller than one strike gap", () => {
+    expect(resolveStressPrice(SOL_FIXTURE_LADDER, { ...SOL_FIXTURE_EXPOSURE, spot: 0.5 }, null)).toBe(0);
+    expect(resolveStressPrice(SOL_FIXTURE_LADDER, { ...SOL_FIXTURE_EXPOSURE, spot: 1 }, null)).toBe(0);
+    expect(resolveStressPrice(SOL_FIXTURE_LADDER, { ...SOL_FIXTURE_EXPOSURE, spot: 1.5 }, null)).toBe(0.5);
+  });
 });
 
 describe("defaultStressPrice", () => {

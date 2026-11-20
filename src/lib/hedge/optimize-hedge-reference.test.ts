@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { BEST_EFFORT_SLACK_FRACTION, FLOOR_TOLERANCE, optimizeHedge } from "@/lib/hedge/optimize-hedge";
+import {
+  BEST_EFFORT_LIFT_SLACK_FRACTION,
+  BEST_EFFORT_SLACK_FRACTION,
+  FLOOR_TOLERANCE,
+  optimizeHedge,
+} from "@/lib/hedge/optimize-hedge";
 import {
   buildReferenceModel,
   referenceMaximumWorstCase,
@@ -15,6 +20,9 @@ const MEDIAN_EXCESS_LIMIT = 0.01;
 
 /** Largest acceptable 90th percentile of the same excess, in dollars. */
 const NINETIETH_EXCESS_LIMIT = 0.06;
+
+/** Fewest best-effort plans that must get the per-case cost check, so the check is not vacuous. */
+const MIN_BEST_EFFORT_COST_CHECKS = 50;
 
 /** The contract increment Gemini uses on every captured ladder. */
 const CENT_INCREMENT = 0.01;
@@ -92,7 +100,7 @@ function randomSmallRequest(random: () => number): HedgeRequest {
     random() < 0.15
       ? baseStrike - spacing * (1 + 3 * random())
       : baseStrike + (random() * (rungCount + 1) - 0.5) * spacing;
-  const quantity = Math.round(random() * 200) / 10;
+  const quantity = Math.max(0.1, Math.round(random() * 200) / 10);
   const stressGuess = Math.min(baseStrike - spacing, spot - spacing);
   const worstExposure = Math.max(0, quantity * (spot - stressGuess));
   return {
@@ -110,6 +118,7 @@ describe("optimizeHedge against an independent vertex-enumeration solver", () =>
     const random = mulberry32(5150);
     const statusCounts: Record<string, number> = {};
     const centIncrementExcess: number[] = [];
+    let bestEffortCostChecks = 0;
     for (let trial = 0; trial < REFERENCE_TRIALS; trial += 1) {
       const request = randomSmallRequest(random);
       const plan = optimizeHedge(request);
@@ -118,7 +127,6 @@ describe("optimizeHedge against an independent vertex-enumeration solver", () =>
       statusCounts[plan.status] = (statusCounts[plan.status] ?? 0) + 1;
 
       const bound = model.roundingBound;
-      const slack = BEST_EFFORT_SLACK_FRACTION * request.exposure.quantity * request.exposure.spot;
       const continuousMinimum = referenceMinimumCost(model, 0);
       const continuousBest = referenceMaximumWorstCase(model).worstCase;
 
@@ -155,11 +163,33 @@ describe("optimizeHedge against an independent vertex-enumeration solver", () =>
       }
 
       if (plan.status === "best-effort") {
+        const lift = continuousBest - model.worstCaseBefore;
+        const slack = Math.min(
+          BEST_EFFORT_SLACK_FRACTION * request.exposure.quantity * request.exposure.spot,
+          BEST_EFFORT_LIFT_SLACK_FRACTION * lift,
+        );
+        const target = continuousBest - slack;
         expect(plan.worstCaseAfter, context).toBeGreaterThan(plan.worstCaseBefore);
         expect(plan.worstCaseAfter, context).toBeLessThan(model.floor);
         expect(plan.worstCaseAfter, context).toBeGreaterThanOrEqual(
           continuousBest - Math.max(slack, bound) - SOLVER_TOLERANCE,
         );
+        // Any rounded plan costs at least the continuous minimum for the worst case it achieves.
+        const achievedMinimum = referenceMinimumCost(model, plan.worstCaseAfter - model.floor);
+        if (achievedMinimum !== null) {
+          expect(plan.totalCost, context).toBeGreaterThanOrEqual(achievedMinimum.cost - SOLVER_TOLERANCE);
+        }
+        // The slack-adjusted target is always reachable before rounding.
+        expect(referenceMinimumCost(model, target - model.floor), context).not.toBeNull();
+        // Finding 4 pin: when the slack leaves room for the full repair margin (2 * bound + 0.005),
+        // the cheapest-plan search must succeed, so the cost is at most the reference minimum at
+        // that margin plus the rounding bound. The pure maximin plan breaks this (for example
+        // $17.21 against a limit of $14.75 on trial 10 when the fix is reverted).
+        const marginedTarget = referenceMinimumCost(model, target + 2 * bound + 0.01 - model.floor);
+        if (marginedTarget !== null) {
+          bestEffortCostChecks += 1;
+          expect(plan.totalCost, context).toBeLessThanOrEqual(marginedTarget.cost + bound + SOLVER_TOLERANCE);
+        }
       }
 
       if (plan.status === "unhedgeable") {
@@ -180,5 +210,7 @@ describe("optimizeHedge against an independent vertex-enumeration solver", () =>
     const ninetieth = centIncrementExcess[Math.floor(0.9 * (centIncrementExcess.length - 1))];
     expect(median).toBeLessThan(MEDIAN_EXCESS_LIMIT);
     expect(ninetieth).toBeLessThan(NINETIETH_EXCESS_LIMIT);
+
+    expect(bestEffortCostChecks).toBeGreaterThan(MIN_BEST_EFFORT_COST_CHECKS);
   });
 });

@@ -7,6 +7,10 @@ import type { Exposure, Ladder, LegSide, PriceState } from "@/lib/hedge/types";
  * the lowest strike minus the median gap between adjacent strikes, or
  * 0.99 * K1 for a one-rung ladder.
  *
+ * Warning: this is the ladder default only. `optimizeHedge` uses
+ * `resolveStressPrice`, which goes lower when spot is near or below the
+ * ladder. Display code should use `plan.stressPrice` or `resolveStressPrice`.
+ *
  * @param {Ladder} ladder - The ladder, rungs sorted ascending by strike.
  * @returns {number} The default stress price in dollars.
  * @throws {RangeError} If the ladder has no rungs.
@@ -23,7 +27,8 @@ export function defaultStressPrice(ladder: Ladder): number {
  * Resolves the evaluation price for state 0 that the optimiser uses.
  *
  * A supplied stress price is used as given. Otherwise the stress price is the
- * lower of `defaultStressPrice(ladder)` and one median strike gap below spot.
+ * lower of `defaultStressPrice(ladder)` and one median strike gap below spot,
+ * with the spot term never below zero (a price cannot go negative).
  * The second term matters when spot is already below the ladder: without it
  * every evaluation price would sit above spot and the holder would wrongly
  * appear to gain in every state.
@@ -39,7 +44,8 @@ export function resolveStressPrice(ladder: Ladder, exposure: Exposure, stressPri
     return stressPrice;
   }
   const strikes = ladder.rungs.map((rung) => rung.strike);
-  return Math.min(defaultStressPrice(ladder), exposure.spot - medianStrikeGap(strikes));
+  const spotTerm = Math.max(0, exposure.spot - medianStrikeGap(strikes));
+  return Math.min(defaultStressPrice(ladder), spotTerm);
 }
 
 /**
@@ -65,8 +71,13 @@ export function legPaysAtPrice(side: LegSide, strike: number, price: number): bo
  * which is where a long holder's loss within the interval is worst.
  * Probabilities come from `impliedDistribution`.
  *
+ * Warning: passing null uses the ladder default (`defaultStressPrice`), which
+ * can differ from the stress price `optimizeHedge` uses when spot is near or
+ * below the ladder. Display code should pass `plan.stressPrice` or the result
+ * of `resolveStressPrice`.
+ *
  * @param {Ladder} ladder - The ladder, rungs sorted ascending by strike.
- * @param {number | null} stressPrice - Evaluation price for state 0, or null for the default.
+ * @param {number | null} stressPrice - Evaluation price for state 0, or null for the ladder default.
  * @returns {PriceState[]} One state per interval, indexed 0..n.
  * @throws {RangeError} If the ladder has no rungs, strikes are not strictly increasing, a quote is invalid, or the stress price is not finite or is at or above the lowest strike.
  */

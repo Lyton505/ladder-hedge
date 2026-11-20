@@ -54,8 +54,16 @@ const CLEAN_DIGITS = 10;
  */
 export const BEST_EFFORT_SLACK_FRACTION = 0.001;
 
-/** Digits kept for reported dollar figures (snapped to 1e-9). */
-const REPORT_DIGITS = 9;
+/**
+ * Cap on the same slack as a fraction of the achievable improvement (lift =
+ * t* minus the unhedged worst case). The slack used is the smaller of the two,
+ * so a `best-effort` plan always keeps at least 95% of the achievable
+ * improvement, even when that improvement is small next to position value.
+ */
+export const BEST_EFFORT_LIFT_SLACK_FRACTION = 0.05;
+
+/** Significant digits kept for reported dollar figures, relative to position value. */
+const REPORT_SIGNIFICANT_DIGITS = 12;
 
 /** Largest position `maxHedgeableQuantity` will search to. */
 const MAX_SEARCH_QUANTITY = 1e9;
@@ -91,15 +99,26 @@ function clean(value: number): number {
 }
 
 /**
- * Snaps a reported dollar figure to 1e-9 so floating-point noise such as
- * -10.000000000000048 reads as -10. Negative zero becomes zero. Used only for
- * reported values, never for decisions.
+ * Snaps a reported dollar figure to a grid of 12 significant digits of the
+ * request's dollar scale, so floating-point noise such as -10.000000000000048
+ * reads as -10 and -5120000.000000005 reads as -5120000. The grid is a power
+ * of ten: 1e-9 for a position worth a few hundred dollars, 1e-4 for one worth
+ * about $72 million. Negative zero becomes zero. Used only for reported
+ * values, never for decisions.
  *
  * @param {number} value - Dollar amount.
+ * @param {number} scale - Positive dollar scale of the request (position value).
  * @returns {number} The snapped amount.
  */
-function snapDollars(value: number): number {
-  const snapped = Number(value.toFixed(REPORT_DIGITS));
+function snapDollars(value: number, scale: number): number {
+  const exponent = Math.floor(Math.log10(scale)) - (REPORT_SIGNIFICANT_DIGITS - 1);
+  let snapped: number;
+  if (exponent < 0) {
+    snapped = Number(value.toFixed(Math.min(100, -exponent)));
+  } else {
+    const quantum = 10 ** exponent;
+    snapped = Math.round(value / quantum) * quantum;
+  }
   return snapped === 0 ? 0 : snapped;
 }
 
@@ -119,11 +138,13 @@ function validateRequest(request: HedgeRequest): void {
   if (!Number.isFinite(takerFeeRate) || takerFeeRate < 0 || takerFeeRate >= 1) {
     throw new RangeError(`takerFeeRate must be in [0, 1), got ${takerFeeRate}`);
   }
-  if (!Number.isFinite(exposure.quantity) || exposure.quantity < 0) {
-    throw new RangeError(`Exposure quantity must be a finite non-negative number (long holdings only), got ${exposure.quantity}`);
+  if (!Number.isFinite(exposure.quantity) || exposure.quantity <= 0) {
+    throw new RangeError(
+      `Exposure quantity must be a finite positive number (a long holding; zero units has nothing to hedge), got ${exposure.quantity}`,
+    );
   }
-  if (!Number.isFinite(exposure.spot) || exposure.spot < 0) {
-    throw new RangeError(`Exposure spot must be a finite non-negative number, got ${exposure.spot}`);
+  if (!Number.isFinite(exposure.spot) || exposure.spot <= 0) {
+    throw new RangeError(`Exposure spot must be a finite positive price (a zero price has nothing to hedge), got ${exposure.spot}`);
   }
   if (assumedDepth !== null && (!Number.isFinite(assumedDepth) || assumedDepth < 0)) {
     throw new RangeError(`assumedDepth must be null or a finite non-negative number, got ${assumedDepth}`);
@@ -534,8 +555,9 @@ function worstHedgedPnl(legs: HedgeLeg[], context: SolveContext): number {
 
 /**
  * Assembles a plan, recomputing cost, every outcome, the worst case and the
- * expected payout from the given (already rounded) legs. Reported dollar
- * figures are snapped to 1e-9.
+ * expected payout from the given (already rounded) legs. Reported P&L and
+ * payout figures are snapped to 12 significant digits of position value (see
+ * `snapDollars`).
  *
  * @param {HedgeStatus} status - Plan status.
  * @param {HedgeLeg[]} legs - Rounded legs.
@@ -543,27 +565,29 @@ function worstHedgedPnl(legs: HedgeLeg[], context: SolveContext): number {
  * @returns {HedgePlan} The plan.
  */
 function assemblePlan(status: HedgeStatus, legs: HedgeLeg[], context: SolveContext): HedgePlan {
+  const scale = context.request.exposure.quantity * context.request.exposure.spot;
   const totalCost = clean(legs.reduce((total, leg) => total + leg.cost, 0));
   const outcomes: StateOutcome[] = context.states.map((state, stateIndex) => {
-    const unhedgedPnl = snapDollars(context.unhedged[stateIndex]);
+    const unhedgedPnl = snapDollars(context.unhedged[stateIndex], scale);
     const hedgePayout = clean(payoutAt(legs, state.evalPrice));
     return {
       ...state,
       unhedgedPnl,
       hedgePayout,
-      hedgedPnl: snapDollars(unhedgedPnl + hedgePayout - totalCost),
+      hedgedPnl: snapDollars(unhedgedPnl + hedgePayout - totalCost, scale),
     };
   });
   const worstCaseAfter = Math.min(...outcomes.map((outcome) => outcome.hedgedPnl));
   const expectedHedgePayout = snapDollars(
     outcomes.reduce((total, outcome) => total + outcome.probability * outcome.hedgePayout, 0),
+    scale,
   );
   return {
     status,
     legs,
     totalCost,
     outcomes,
-    worstCaseBefore: snapDollars(context.worstCaseBefore),
+    worstCaseBefore: snapDollars(context.worstCaseBefore, scale),
     worstCaseAfter,
     expectedHedgePayout,
     requestedMaxLoss: context.request.maxLoss,
@@ -611,6 +635,22 @@ function cheapestPlanMeeting(context: SolveContext, target: number): CheapestPla
 }
 
 /**
+ * Returns how far below the best achievable worst case t* a `best-effort`
+ * plan may sit: the smaller of BEST_EFFORT_SLACK_FRACTION of position value
+ * and BEST_EFFORT_LIFT_SLACK_FRACTION of the achievable lift. Because the lift
+ * term is always below the lift, the resulting target stays above the
+ * unhedged worst case, so the cheapest plan meeting it is never "buy nothing".
+ *
+ * @param {HedgeRequest} request - The request.
+ * @param {number} lift - t* minus the unhedged worst case, in dollars (positive).
+ * @returns {number} The slack in dollars.
+ */
+function bestEffortSlack(request: HedgeRequest, lift: number): number {
+  const valueSlack = BEST_EFFORT_SLACK_FRACTION * request.exposure.quantity * request.exposure.spot;
+  return Math.min(valueSlack, BEST_EFFORT_LIFT_SLACK_FRACTION * lift);
+}
+
+/**
  * Runs the full optimiser and also reports whether the floor is reachable
  * before rounding (which `maxHedgeableQuantity` uses to stop its search).
  *
@@ -647,7 +687,7 @@ function planHedge(request: HedgeRequest): PlanResult {
     return { plan: assemblePlan("optimal", maximinLegs, context), floorFeasible };
   }
 
-  const slack = BEST_EFFORT_SLACK_FRACTION * request.exposure.quantity * request.exposure.spot;
+  const slack = bestEffortSlack(request, lift);
   const relaxed = cheapestPlanMeeting(context, worstCaseBefore + lift - slack);
   let legs = maximinLegs;
   if (relaxed.legs !== null && worstHedgedPnl(relaxed.legs, context) > worstCaseBefore + EPSILON) {
@@ -672,19 +712,22 @@ function planHedge(request: HedgeRequest): PlanResult {
  *   leaves the worst case below the floor, stage 1 is re-solved with the floor
  *   raised by the shortfall until the rounded plan meets it.
  * - If the floor cannot be met, stage 2 finds the best achievable worst case
- *   t*. The plan returned is the cheapest rounded plan whose worst case is at
- *   least t* - BEST_EFFORT_SLACK_FRACTION * quantity * spot (`best-effort`),
- *   falling back to the rounded maximin plan if that search fails. A stage 2
+ *   t* and its lift over the unhedged worst case. The plan returned is the
+ *   cheapest rounded plan whose worst case is at least t* - slack, where slack
+ *   is the smaller of BEST_EFFORT_SLACK_FRACTION * quantity * spot and
+ *   BEST_EFFORT_LIFT_SLACK_FRACTION * lift (`best-effort`). It therefore keeps
+ *   at least 95% of the achievable improvement. If that search finds no
+ *   rounded plan, the rounded maximin plan is returned instead. A stage 2
  *   plan that meets the floor after rounding is labelled `optimal`; one that
  *   does not improve the worst case gives `unhedgeable`.
  * - A plan labelled `optimal` always meets the floor after rounding, within
  *   `floorTolerance` (at most FLOOR_TOLERANCE dollars of floating-point noise).
- * - Every number in the returned plan describes the rounded legs; dollar
- *   figures are snapped to 1e-9.
+ * - Every number in the returned plan describes the rounded legs; P&L figures
+ *   are snapped to 12 significant digits of position value.
  *
  * @param {HedgeRequest} request - Ladder, exposure, loss limit, stress price, fee rate and assumed depth.
  * @returns {HedgePlan} The plan.
- * @throws {RangeError} If the request has out-of-range values, unsorted strikes, invalid quotes, or the ladder has no rungs.
+ * @throws {RangeError} If the request has out-of-range values (including a non-positive quantity or spot), unsorted strikes, invalid quotes, or the ladder has no rungs.
  * @throws {Error} If the linear programming solver fails unexpectedly.
  */
 export function optimizeHedge(request: HedgeRequest): HedgePlan {
