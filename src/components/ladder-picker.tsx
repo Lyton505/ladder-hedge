@@ -21,6 +21,16 @@ export interface LadderPickerProps {
   loading?: boolean;
   /** A readable message when the list could not be loaded. */
   error?: string | null;
+  /** Optional per-ladder notes keyed by event ticker: the horizon (for example "Daily") and a short detail. */
+  notes?: Readonly<Record<string, LadderNote>>;
+}
+
+/** Extra facts shown for one ladder in the picker. */
+export interface LadderNote {
+  /** How far ahead the ladder settles, for example "Hourly", "Daily" or "Month end". */
+  horizon: string;
+  /** A short detail, for example "12 two-sided". */
+  detail?: string | null;
 }
 
 /**
@@ -39,6 +49,7 @@ export function LadderPicker({
   asset,
   loading = false,
   error = null,
+  notes,
 }: LadderPickerProps) {
   const headingId = useId();
 
@@ -80,6 +91,7 @@ export function LadderPicker({
             const selected = ladder.eventTicker === selectedTicker;
             const countdown = nowMs !== null ? formatCountdown(ladder.expiry, nowMs) : null;
             const expired = countdown === "expired";
+            const note = notes?.[ladder.eventTicker];
             return (
               <button
                 key={ladder.eventTicker}
@@ -98,6 +110,9 @@ export function LadderPicker({
                   <DataSourceBadge source={ladder.source} />
                 </span>
                 <span className="figures flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-graphite">
+                  {note !== undefined ? (
+                    <span className="stretch-semiwide font-semibold text-ink">{note.horizon}</span>
+                  ) : null}
                   <span className={expired ? "font-medium text-alarm" : "font-medium text-ink"}>
                     {countdown === null
                       ? "Expiry"
@@ -111,6 +126,9 @@ export function LadderPicker({
                   <span>
                     {ladder.quotedRungCount} of {ladder.rungCount} rungs quoted
                   </span>
+                  {note !== undefined && note.detail !== undefined && note.detail !== null && note.detail !== "" ? (
+                    <span>{note.detail}</span>
+                  ) : null}
                 </span>
               </button>
             );

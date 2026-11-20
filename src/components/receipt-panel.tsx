@@ -15,6 +15,8 @@ export interface ReceiptPanelProps {
   recording: boolean;
   /** A readable message when the last attempt failed. */
   error: string | null;
+  /** A neutral message about the last attempt, for example that a fill was saved without a receipt. */
+  notice?: string | null;
   /** True when a Solana wallet is connected, so the receipt can be sent. */
   walletConnected: boolean;
   /** Paper fills saved in this browser, newest first. */
@@ -84,6 +86,7 @@ export function ReceiptPanel({
   disabledReason = null,
   recording,
   error,
+  notice = null,
   walletConnected,
   fills,
   receipts,
@@ -133,6 +136,11 @@ export function ReceiptPanel({
         {error !== null && error !== "" ? (
           <p role="alert" className="rounded-[5px] border border-alarm/30 bg-alarm-tint px-3 py-2 text-sm text-alarm">
             {error}
+          </p>
+        ) : null}
+        {notice !== null && notice !== "" ? (
+          <p role="status" className="rounded-[5px] border border-rule bg-fog px-3 py-2 text-sm text-ink">
+            {notice}
           </p>
         ) : null}
       </div>

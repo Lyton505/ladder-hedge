@@ -36,6 +36,10 @@ export interface PlanStatsProps {
    * the numbers it explains.
    */
   chartSlot?: React.ReactNode;
+  /** Replaces the text shown when `maxHedgeableQuantity` is null, for example while it is being computed. */
+  maxHedgeableNote?: string | null;
+  /** Replaces the "on assumed depth" / "on quoted sizes" caption under the largest hedgeable quantity. */
+  depthNote?: string | null;
 }
 
 /** Plain-language headline and explanation for each plan status. */
@@ -182,6 +186,8 @@ export function PlanStats({
   loading = false,
   error = null,
   chartSlot = null,
+  maxHedgeableNote = null,
+  depthNote = null,
 }: PlanStatsProps) {
   if (error !== null && error !== "") {
     return (
@@ -222,6 +228,14 @@ export function PlanStats({
   const floorMet = plan.worstCaseAfter >= floor - 0.005;
   const bottomOutcome = plan.outcomes.length > 0 ? plan.outcomes[0] : null;
   const countdown = expiry !== null && nowMs !== null ? formatCountdown(expiry, nowMs) : null;
+  // Large positions (BTC) produce figures like -$17,611.55 that overflow at the largest size.
+  const longestFigure = Math.max(
+    formatUsd(plan.worstCaseBefore).length,
+    formatUsd(plan.worstCaseAfter).length,
+    formatUsd(plan.totalCost).length,
+  );
+  const figureSize =
+    longestFigure > 8 ? "text-[1.75rem] @3xl:text-[2.125rem]" : "text-[2.5rem] @3xl:text-5xl";
 
   return (
     <section aria-label="Hedge summary" className="@container flex flex-col gap-6">
@@ -238,19 +252,19 @@ export function PlanStats({
       <div className="grid grid-cols-1 gap-x-8 gap-y-5 @2xl:grid-cols-[1fr_1fr_auto]">
         <div className="flex flex-col gap-1">
           <span className="text-sm text-graphite">Worst case without a hedge</span>
-          <span className="figures stretch-wide text-[2.5rem] font-medium leading-none tracking-tight text-ink/75 @3xl:text-5xl">
+          <span className={`figures stretch-wide ${figureSize} font-medium leading-none tracking-tight text-ink/75`}>
             {formatUsd(plan.worstCaseBefore)}
           </span>
         </div>
         <div className="flex flex-col gap-1">
           <span className="text-sm font-medium text-ink">Worst case with the hedge</span>
-          <span className="figures stretch-wide text-[2.5rem] font-bold leading-none tracking-tight text-cobalt @3xl:text-5xl">
+          <span className={`figures stretch-wide ${figureSize} font-bold leading-none tracking-tight text-cobalt`}>
             {formatUsd(plan.worstCaseAfter)}
           </span>
         </div>
         <div className="flex flex-col gap-1 @2xl:border-l @2xl:border-rule @2xl:pl-8">
           <span className="text-sm text-graphite">Cost of the hedge</span>
-          <span className="figures stretch-wide text-[2.5rem] font-bold leading-none tracking-tight text-ink @3xl:text-5xl">
+          <span className={`figures stretch-wide ${figureSize} font-bold leading-none tracking-tight text-ink`}>
             {formatUsd(plan.totalCost)}
           </span>
           <span className="figures text-xs text-graphite">
@@ -289,11 +303,19 @@ export function PlanStats({
                 {formatQuantity(maxHedgeableQuantity)} {asset}
               </dd>
               <dd className="text-xs text-graphite">
-                {depthAssumed ? "at this floor, on assumed depth" : "at this floor, on quoted sizes"}
+                {depthNote !== null && depthNote !== ""
+                  ? depthNote
+                  : depthAssumed
+                    ? "at this floor, on assumed depth"
+                    : "at this floor, on quoted sizes"}
               </dd>
             </>
           ) : (
-            <dd className="text-sm leading-snug text-graphite">not known: depth is unlimited or unknown</dd>
+            <dd className="text-sm leading-snug text-graphite">
+              {maxHedgeableNote !== null && maxHedgeableNote !== ""
+                ? maxHedgeableNote
+                : "not known: depth is unlimited or unknown"}
+            </dd>
           )}
         </div>
         <div className="flex flex-col gap-0.5">

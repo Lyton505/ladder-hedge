@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Archivo } from "next/font/google";
+import { SolanaProvider } from "@/components/solana-provider";
 import "./globals.css";
 
 /** Archivo variable font with its width axis, used for every piece of text. */
@@ -17,7 +18,8 @@ export const metadata: Metadata = {
 };
 
 /**
- * Root layout shared by every route.
+ * Root layout shared by every route. Wraps every page in the Solana connection and
+ * wallet providers so any page can read the wallet.
  *
  * @param {Readonly<{ children: React.ReactNode }>} props - Layout props.
  * @param {React.ReactNode} props.children - The active route's content.
@@ -28,7 +30,9 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className={`${archivo.variable} h-full antialiased`}>
-      <body className="min-h-full flex flex-col bg-fog text-ink">{children}</body>
+      <body className="min-h-full flex flex-col bg-fog text-ink">
+        <SolanaProvider>{children}</SolanaProvider>
+      </body>
     </html>
   );
 }
