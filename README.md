@@ -131,7 +131,18 @@ The bundled snapshot `SOL2611202200-SNAPSHOT` is Gemini's "SOL price on November
 | 3% | `optimal` | $9.72 | $7.83 | -$78.92 / -$21.56 |
 | 5% | `optimal` | $3.67 | $2.48 | -$78.92 / -$35.94 |
 
-The cost of a floor falls steeply as the floor is loosened. Tight floors force the basket to cover intervals above spot as well, because the cost of the hedge itself counts against the floor in every interval; the gross outlay is then large, but most of it comes back in expectation (net expected cost $3.28 at 1.5%). Below about 1.3% no basket on this ladder meets the floor.
+The cost of a floor falls steeply as the floor is loosened. Tight floors force the basket to cover intervals above spot as well, because the cost of the hedge itself counts against the floor in every interval; the gross outlay is then large, but most of it comes back in expectation (net expected cost $3.27 at 1.5%, as the page shows it: $37.23 minus $33.96). Below about 1.3% no basket on this ladder meets the floor. These rows are the engine with no cash limit; every one of them costs under 10% of the position ($71.89), so the page's default cash limit of 10% leaves all four plans unchanged (checked: identical plans).
+
+### What the cash limit changes: a month-end ladder
+
+Without a cash limit, a ladder far wider than spot can produce a plan nobody would place. On the live "SOL price on November 30" ladder (`SOL2611302200`, strikes $55 to $110, quotes read 2026-11-20 06:20 UTC, SOL at $72.547), for 10 SOL ($725.47), a 1.5% floor (-$10.88), fee 0.07 and an assumed depth of 100:
+
+| Cash limit | Status | Paid up front | Expected payout | Net expected cost | Worst case before / after |
+|---|---|---|---|---|---|
+| None | `best-effort` | $337.89 (46.6% of the position) | $324.97 | $12.92 | -$225.47 / -$36.61 |
+| 10% ($72.55, the page default) | `best-effort` | $70.76 (9.8%) | $61.82 | $8.94 | -$225.47 / -$48.26 |
+
+The floor is out of reach on this ladder at any price (its lowest strike is $55, so the stress price is $50). Without a limit the engine lifts the worst case to -$36.61, and about $150 of the $338 goes on 151.75 NO $110 contracts at $0.99, a near-certain dollar. Within the 10% limit it buys NO $55 to NO $75 for $70.76 and the worst case is -$48.26; the page says both: "No basket on this ladder holds every price range at -$10.88, at any price: the best it can reach is -$36.61, for $337.89 up front. Your cash limit is $72.55." Live quotes move, so the exact figures differ from minute to minute.
 
 ## How the hedge is computed
 
@@ -170,6 +181,16 @@ Solved with [yalps](https://www.npmjs.com/package/yalps), a simplex solver writt
 
 If the unhedged worst case already meets the floor, neither program runs.
 
+### Cash limit
+
+The request can carry a cash limit, `maxOutlay`: the most the plan may pay up front, fees included (the page sets it as a share of position value, 10% by default, or "No limit"). The engine treats it as a hard constraint:
+
+- The plan is first computed with no limit. If that plan already costs no more than the limit, it is returned unchanged, whatever its status, so a limit that does not bind changes nothing.
+- Otherwise stage 1, stage 2 and the best-effort search all run with `totalCost <= maxOutlay` added to the linear program (cost as modelled there: unit cost with the linear fee). A floor reachable within the limit gives `optimal`. A floor reachable without the limit but not within it gives `best-effort`: the cheapest plan within the usual slack of the best worst case reachable inside the limit. If nothing affordable improves the worst case, the result is `unhedgeable`. A limit of 0 buys nothing.
+- The reported, rounded total cost never exceeds the limit. Rounding quantities up and fees up to the cent can push a plan the solver kept within the limit over it; the engine then re-solves with the limit given to the solver lowered by the overrun (growing geometrically, the last attempt by the same provable rounding bound used for the floor), exactly as it repairs the floor.
+
+When the plan falls short of the floor and the limit binds, the page also solves once without the limit and says which of the two stands in the way: "Meeting your floor of -$10.86 needs $45.10 up front; your cash limit is $7.24" when only cash is missing, or that no basket on the ladder meets the floor at any price, with what the ladder could reach and for how much, when the floor is out of reach anyway. It never says a limited plan meets the floor.
+
 ### Rounding to tradable quantities
 
 After solving, legs under half a quantity increment are dropped and the rest are rounded **up** to a whole number of increments (caps are rounded down to whole increments beforehand, so rounding up cannot pass a cap). Each leg's fee is then computed and rounded up to the next cent, and every reported number (cost, outcomes, worst case, expected payout) is recomputed from the rounded legs.
@@ -181,13 +202,13 @@ Rounding and cent fees can push the worst case below the floor. When that happen
 | Status | Meaning |
 |---|---|
 | `optimal` | The floor is met at minimum cost. |
-| `best-effort` | The floor cannot be met with the quoted legs and depth. The plan lifts the worst case nearly as far as possible and reports the worst case it actually achieves. |
-| `no-hedge-needed` | The unhedged worst case already meets the floor. No legs. |
-| `unhedgeable` | No available leg improves the worst case. No legs. |
+| `best-effort` | The floor cannot be met with the quoted legs and depth, or not within the cash limit. The plan lifts the worst case nearly as far as possible (within the limit, when one is set) and reports the worst case it actually achieves. |
+| `no-hedge-needed` | The unhedged worst case already meets the floor. No legs. Does not depend on the cash limit. |
+| `unhedgeable` | No available leg, or none affordable within the cash limit, improves the worst case. No legs. |
 
 ### Largest hedgeable position
 
-`maxHedgeableQuantity` answers "how big a position can these quotes protect to this floor?", with the floor held at a fixed share of position value. It returns:
+`maxHedgeableQuantity` answers "how big a position can these quotes protect to this floor?", with the floor held at a fixed share of position value. When the page has a cash limit set, the limit is also held at its share of position value at every size tried, so the answer is the largest size protected to the floor within the limit. It returns:
 
 - "any size" (infinity) when no position needs a hedge at that floor;
 - "not known" (null) when a usable leg has no cap, because the answer would be unbounded;
@@ -216,7 +237,7 @@ The engine also rejects malformed ladders before solving: strikes must be strict
 ## Economic design
 
 - **Instrument.** Each NO contract at strike K is a digital put: $1 if the asset settles below K. A strip of NO contracts at several strikes builds a step-shaped put that pays more the further the price falls, down to the lowest strike.
-- **Objective.** Robust (scenario) cost minimisation: the cheapest basket that keeps the worst case at or above the floor in every interval. It does not depend on anyone's forecast. Probabilities are shown, not optimised.
+- **Objective.** Robust (scenario) cost minimisation: the cheapest basket that keeps the worst case at or above the floor in every interval, never paying more up front than the user's cash limit. It does not depend on anyone's forecast. Probabilities are shown, not optimised.
 - **Prices paid.** Executable top-of-book prices (YES ask, or 1 - YES bid for NO) plus Gemini's taker fee of `0.07 x contracts x price x (1 - price)` rounded up to the cent, with no settlement fee (source: https://www.gemini.com/fees/predictions). The engine never assumes fills at mid. The net expected cost the app shows (cost minus mid-implied expected payout) is roughly what crossing the spread and paying the fee costs.
 - **Size.** Each leg is capped at the size shown at the best price, so the plan never assumes more liquidity than the top of the book offers. When the size is unknown, an assumed depth is used and labelled as assumed.
 - **Counterparties.** Gemini's order-book makers. The project runs no pool, vault or token, uses no leverage and has no liquidation. The most a basket can lose is its cost.
@@ -236,6 +257,7 @@ The engine also rejects malformed ladders before solving: strikes must be strict
 10. **Implied probabilities are market prices, not forecasts.** They are mids with simple rules for one-sided and unquoted rungs, smoothed to be consistent. They inform the expected payout, and so the net expected cost in the headline, and nothing else; the hedge itself is chosen on executable prices.
 11. **Long holdings only.** The engine rejects a negative quantity; short exposure is not modelled.
 12. **Venue risk is not modelled.** The plan assumes Gemini settles its contracts as specified.
+13. **The cash limit caps the up-front outlay, not the loss.** It bounds what leaves the account when the basket is bought (contracts plus fees, at the quoted asks). A plan held to the limit can fall short of the floor; the page then says so and shows the worst case it actually reaches. The limit is set as a share of position value at the current spot, so it moves with spot like the floor does. It is not recorded in the on-chain receipt.
 
 ## How it uses Solana
 
@@ -307,14 +329,15 @@ Browser (Next.js client components)                  Server (Next.js route handl
         Solana Explorer link for each receipt signature
 ```
 
-Data flow for one plan: the page lists ladders for the chosen asset, loads one ladder (live with sizes, or a snapshot) and the spot price (Gemini's ticker for a live ladder, the spot captured with it for a snapshot), and runs the engine in the browser. When an input changes it recomputes the price states, the linear programs and the payoff curve (following a deferred copy of the inputs, so a slider drag stays responsive); the consistency check reruns when the ladder or fee rate changes; the largest hedgeable position runs once the inputs have been still for 350 ms. The engine is not called while the quantity is blank or not above zero, or while spot is missing; the page shows a prompt or the loading or spot-error state instead. Any error the engine throws is caught and shown as a message in place of the plan (or in the consistency panel, or under the largest hedgeable position). Paper fill builds the memo from the request the displayed plan was computed from, saves the fill locally without a signature, then, if a wallet is connected, asks it to sign the receipt and stores the signature on success. With no wallet the fill is saved and the page says no receipt was written; if the user rejects or the RPC fails, the fill stays saved without a signature and the error is shown.
+Data flow for one plan: the page lists ladders for the chosen asset, loads one ladder (live with sizes, or a snapshot) and the spot price (Gemini's ticker for a live ladder, the spot captured with it for a snapshot), and runs the engine in the browser. When an input changes it recomputes the price states, the linear programs and the payoff curve (following a deferred copy of the inputs, so a slider drag stays responsive); the consistency check reruns when the ladder or fee rate changes; when a cash limit is set and the plan falls short of the floor, the plan without the limit is computed once more (memoised on the same inputs) for the status line; the largest hedgeable position runs once the inputs have been still for 350 ms. The engine is not called while the quantity is blank or not above zero, or while spot is missing; the page shows a prompt or the loading or spot-error state instead. Any error the engine throws is caught and shown as a message in place of the plan (or in the consistency panel, or under the largest hedgeable position). Paper fill builds the memo from the request the displayed plan was computed from, saves the fill locally without a signature, then, if a wallet is connected, asks it to sign the receipt and stores the signature on success. With no wallet the fill is saved and the page says no receipt was written; if the user rejects or the RPC fails, the fill stays saved without a signature and the error is shown.
 
 ### Page behaviour
 
 - Starts on SOL and picks the live, unexpired ladder with the most two-sided rungs, provided it has at least 3 (ties go to the later expiry; hourly ladders are often thin), falling back to a snapshot. Assets offered: SOL, BTC, ETH, XRP (snapshots exist for SOL, BTC and ETH).
-- Quantity is what the user typed, else the connected wallet's SOL balance (SOL only, when above zero), else 10. The floor is set as a share of position value (default 1.5%, slider from 0.25% to 10%), the fee rate defaults to 7%, and the assumed depth to 100 contracts.
-- The headline shows three figures: worst case without the hedge, worst case with it, and the net expected cost (up-front cost minus the expected payout at the ladder's own market-implied probabilities, which is not a forecast). The up-front cost, fees included, and the expected payout are shown directly beneath it.
-- Below the payoff chart: the largest position hedgeable at this floor (with whether it rests on measured or assumed depth, or "Any size" when no position needs a hedge at this floor) and the time to expiry. Under the legs table, one line says whether the plan's size limits are measured, assumed or mixed.
+- Quantity is what the user typed, else the connected wallet's SOL balance (SOL only, when above zero), else 10. The floor is set as a share of position value (default 1.5%, slider from 0.25% to 10%). The cash limit, under the floor, is the most the plan may pay up front, fees included, as a share of position value with the dollar amount shown (default 10%, slider from 1% to 50% in 0.5% steps, plus a "No limit" switch that remembers the last setting). The fee rate defaults to 7%, and the assumed depth to 100 contracts.
+- The headline shows three figures: worst case without the hedge, worst case with it, and the net expected cost (up-front cost minus the expected payout at the ladder's own market-implied probabilities, which is not a forecast). The up-front cost, fees included, and the expected payout are shown directly beneath it, each rounded to the cent, and the net is their difference as displayed.
+- When the plan falls short of the floor because of the cash limit, the status line says so and how much the floor would need ("Floor out of reach within your cash limit"), or, when the floor is out of reach at any price, what the ladder could reach without the limit and for how much. When the limit does not change the plan, nothing about it is shown beyond the control.
+- Below the payoff chart: the largest position hedgeable at this floor and cash limit (with whether it rests on measured or assumed depth, or "Any size" when no position needs a hedge at this floor) and the time to expiry. Under the legs table, one line says whether the plan's size limits are measured, assumed or mixed.
 - Notices above the plan cover snapshot data, an expired ladder, spot below the lowest strike or above the highest strike, and a failed ladder or spot refresh (the last data is kept and its time shown). A permanent "What this hedge does not do" box states expiry-only protection, no protection below the lowest strike, settlement reference versus spot, simulated fills and no promise of profit.
 - "Paper fill and record receipt" is disabled while the plan is updating, for an expired ladder, or when the plan buys nothing.
 - Live ladders and spot refresh every 15 seconds while the tab is visible, and the fetch time is shown; the ladder list refreshes every 60 seconds.
@@ -410,7 +433,8 @@ It prints the throwaway address; fund it at https://faucet.solana.com within the
 - **Top of book only.** Each leg is priced at the best quote and capped at the size there. Deeper levels, which would allow larger hedges at worse prices, are not used.
 - **Snapshots have no sizes,** so on a snapshot every cap is the assumed depth.
 - **Rounding costs a little.** The repair that keeps rounded plans above the floor raises the floor uniformly and in growing steps, so an `optimal` plan can cost slightly more than the true rounded minimum; in an independent review against a separate solver the median excess was under one cent. Very rarely a floor reachable before rounding (by under 1.5 cents) is reported as `best-effort`.
-- **`best-effort` trades a little protection for cost.** It returns the cheapest plan whose worst case is within the smaller of 0.1% of position value and 5% of the achievable improvement of the best reachable worst case, so its worst case can sit up to that much below the true maximum. Its gross outlay can still be large near the feasibility limit (see the 1% row above).
+- **`best-effort` trades a little protection for cost.** It returns the cheapest plan whose worst case is within the smaller of 0.1% of position value and 5% of the achievable improvement of the best reachable worst case, so its worst case can sit up to that much below the true maximum. Its gross outlay can still be large near the feasibility limit (see the 1% row above); the cash limit caps it (see the month-end example).
+- **The cash limit sees fees only as the linear formula.** Gemini rounds each leg's fee up to the cent, a fixed cost per leg the linear programs cannot see. The engine repairs any overrun, so the limit is never exceeded, but with a limit of only a few cents the repair can leave a plan that buys little or nothing (`unhedgeable`) even though one carefully chosen contract might have fit.
 - **Static hedge.** No rebalancing, no early exit, and no mark-to-market view before expiry.
 - **The stress price is the default** described above. The engine accepts another value, but the page does not expose it.
 - **One expiry at a time.** Ladders with different expiries are not combined.
