@@ -1,10 +1,18 @@
 "use client";
 
 import { useId, useState } from "react";
+import {
+  DEFAULT_MAX_OUTLAY_FRACTION,
+  MAX_MAX_OUTLAY_FRACTION,
+  MIN_MAX_OUTLAY_FRACTION,
+} from "@/lib/client/workbench-model";
 import { formatPercent, formatQuantity, formatUsd } from "./format";
 
 /** Contracts restored when the "unlimited" toggle is switched off with no earlier value. */
 const DEFAULT_ASSUMED_DEPTH = 100;
+
+/** Step of the cash-limit slider, as a fraction of position value (0.5%). */
+const OUTLAY_STEP_FRACTION = 0.005;
 
 /** Props for {@link NumberField}. */
 export interface NumberFieldProps {
@@ -144,6 +152,10 @@ export interface FloorControlsProps {
   maxLossFraction: number;
   /** Called with a new fraction when the slider moves. */
   onMaxLossFractionChange: (fraction: number) => void;
+  /** Cash limit: the most the plan may pay up front, as a fraction of position value; null means no limit. */
+  maxOutlayFraction: number | null;
+  /** Called with a new cash-limit fraction, or null for no limit. */
+  onMaxOutlayFractionChange: (fraction: number | null) => void;
   /** Gemini taker fee rate as a fraction, for example 0.07. */
   takerFeeRate: number;
   /** Called with a new fee rate as a fraction. */
@@ -163,8 +175,9 @@ export interface FloorControlsProps {
 }
 
 /**
- * Inputs that define the hedge request: the loss floor, the taker fee rate and
- * the depth assumed for each contract.
+ * Inputs that define the hedge request: the loss floor, the cash limit (the most
+ * the plan may pay up front, or no limit), the taker fee rate and the depth
+ * assumed for each contract.
  *
  * @param {FloorControlsProps} props - Component props.
  * @returns {JSX.Element} The controls.
@@ -173,6 +186,8 @@ export function FloorControls({
   positionValue,
   maxLossFraction,
   onMaxLossFractionChange,
+  maxOutlayFraction,
+  onMaxOutlayFractionChange,
   takerFeeRate,
   onTakerFeeRateChange,
   assumedDepth,
@@ -188,7 +203,15 @@ export function FloorControls({
   const feeHelpId = `${baseId}-fee-help`;
   const depthId = `${baseId}-depth`;
   const depthHelpId = `${baseId}-depth-help`;
+  const outlayId = `${baseId}-outlay`;
+  const outlayHelpId = `${baseId}-outlay-help`;
   const [lastDepth, setLastDepth] = useState<number>(assumedDepth ?? DEFAULT_ASSUMED_DEPTH);
+  const [lastOutlayFraction, setLastOutlayFraction] = useState<number>(
+    maxOutlayFraction ?? DEFAULT_MAX_OUTLAY_FRACTION,
+  );
+  const noOutlayLimit = maxOutlayFraction === null;
+  const outlayFractionShown = maxOutlayFraction ?? lastOutlayFraction;
+  const maxOutlayAmount = outlayFractionShown * positionValue;
 
   const isUnlimited = assumedDepth === null;
   const maxLossDollars = maxLossFraction * positionValue;
@@ -209,6 +232,34 @@ export function FloorControls({
       return;
     }
     onAssumedDepthChange(lastDepth);
+  }
+
+  /**
+   * Switches between no cash limit and the last limit used.
+   *
+   * @param {boolean} unlimited - True to remove the limit.
+   * @returns {void}
+   */
+  function handleNoOutlayLimitChange(unlimited: boolean): void {
+    if (unlimited) {
+      if (maxOutlayFraction !== null) {
+        setLastOutlayFraction(maxOutlayFraction);
+      }
+      onMaxOutlayFractionChange(null);
+      return;
+    }
+    onMaxOutlayFractionChange(lastOutlayFraction);
+  }
+
+  /**
+   * Reports a new cash-limit fraction from the slider and remembers it for the "No limit" toggle.
+   *
+   * @param {number} fraction - Share of position value.
+   * @returns {void}
+   */
+  function handleOutlayFractionChange(fraction: number): void {
+    setLastOutlayFraction(fraction);
+    onMaxOutlayFractionChange(fraction);
   }
 
   /**
@@ -254,6 +305,58 @@ export function FloorControls({
           <span>{formatPercent(minFraction)}</span>
           <span>{formatPercent(maxFraction, 0)}</span>
         </div>
+      </div>
+
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="stretch-semiwide text-[15px] font-semibold">Cash limit</h2>
+          <label className="flex cursor-pointer items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={noOutlayLimit}
+              onChange={(event) => handleNoOutlayLimitChange(event.target.checked)}
+              className="h-4 w-4"
+            />
+            No limit
+          </label>
+        </div>
+        <label htmlFor={outlayId} className="text-sm text-graphite">
+          The most you will pay up front, fees included
+        </label>
+        <div className="flex items-baseline justify-between gap-3">
+          <span className={`figures stretch-wide text-2xl font-semibold tracking-tight ${noOutlayLimit ? "text-graphite" : ""}`}>
+            {noOutlayLimit ? "No limit" : hasPosition ? formatUsd(maxOutlayAmount) : "–"}
+          </span>
+          <span className="figures text-sm text-graphite">
+            {noOutlayLimit ? "any amount" : `${formatPercent(outlayFractionShown, 1)} of position`}
+          </span>
+        </div>
+        <input
+          id={outlayId}
+          type="range"
+          min={MIN_MAX_OUTLAY_FRACTION}
+          max={MAX_MAX_OUTLAY_FRACTION}
+          step={OUTLAY_STEP_FRACTION}
+          value={outlayFractionShown}
+          disabled={noOutlayLimit}
+          aria-describedby={outlayHelpId}
+          aria-valuetext={
+            noOutlayLimit
+              ? "No limit"
+              : `${formatPercent(outlayFractionShown, 1)} of position, ${formatUsd(maxOutlayAmount)}`
+          }
+          onChange={(event) => handleOutlayFractionChange(Number(event.target.value))}
+          className="h-6 w-full cursor-pointer disabled:cursor-not-allowed disabled:opacity-40"
+        />
+        <div className="figures flex justify-between text-xs text-graphite" aria-hidden="true">
+          <span>{formatPercent(MIN_MAX_OUTLAY_FRACTION, 0)}</span>
+          <span>{formatPercent(MAX_MAX_OUTLAY_FRACTION, 0)}</span>
+        </div>
+        <p id={outlayHelpId} className="text-xs leading-relaxed text-graphite">
+          {noOutlayLimit
+            ? "The plan may ask for any amount up front to reach the floor."
+            : "The plan never pays more than this. If the floor needs more, you get the best protection within it, and the page says how much the floor would take."}
+        </p>
       </div>
 
       <div className="flex flex-col gap-2">

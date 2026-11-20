@@ -36,6 +36,14 @@ const MAX_REPAIR_ATTEMPTS = 12;
 /** Extra margin, in dollars, added to the floor on the first repair attempt; doubles on each later one. */
 const REPAIR_MIN_STEP = 0.005;
 
+/**
+ * Largest number of dollars by which a rounded plan's total cost may exceed the
+ * cash limit (`maxOutlay`): floating-point noise only. Real overruns from
+ * rounding quantities and fees up are repaired by tightening the limit given
+ * to the solver, never tolerated.
+ */
+export const OUTLAY_TOLERANCE = 1e-9;
+
 /** Most a cent-rounded fee can exceed the linear fee the solver assumed, in dollars. */
 const FEE_ROUNDING_SLACK = 0.01;
 
@@ -127,7 +135,7 @@ function snapDollars(value: number, scale: number): number {
  *
  * @param {HedgeRequest} request - The request to validate.
  * @returns {void}
- * @throws {RangeError} If maxLoss, fee rate, exposure, depth, an increment, a strike, a quote or a size is out of range.
+ * @throws {RangeError} If maxLoss, fee rate, exposure, depth, the cash limit (maxOutlay), an increment, a strike, a quote or a size is out of range.
  */
 function validateRequest(request: HedgeRequest): void {
   const { exposure, maxLoss, takerFeeRate, assumedDepth } = request;
@@ -148,6 +156,10 @@ function validateRequest(request: HedgeRequest): void {
   }
   if (assumedDepth !== null && (!Number.isFinite(assumedDepth) || assumedDepth < 0)) {
     throw new RangeError(`assumedDepth must be null or a finite non-negative number, got ${assumedDepth}`);
+  }
+  const { maxOutlay } = request;
+  if (maxOutlay !== undefined && maxOutlay !== null && (!Number.isFinite(maxOutlay) || maxOutlay < 0)) {
+    throw new RangeError(`maxOutlay must be null, omitted or a finite non-negative number of dollars, got ${maxOutlay}`);
   }
   request.ladder.rungs.forEach((rung) => {
     if (!Number.isFinite(rung.quantityIncrement) || rung.quantityIncrement <= 0) {
@@ -262,16 +274,25 @@ function candidateLegs(request: HedgeRequest, states: PriceState[]): CandidateLe
 
 /**
  * Builds the constraint map shared by both linear programs: one constraint per
- * state on the leg-dependent part of hedged P&L, plus one cap per capped leg.
+ * state on the leg-dependent part of hedged P&L, one cap per capped leg, and,
+ * when a cash limit applies, one bound on total linear cost.
  *
  * Every state constraint carries each leg's full unit cost, so total cost
- * reduces hedged P&L in every state, not only in the objective.
+ * reduces hedged P&L in every state, not only in the objective. The cost bound
+ * uses the same "cost" coefficients (unit cost, linear fee included) as the
+ * stage 1 objective; with no limit it is not added at all, so unlimited models
+ * are exactly the ones the engine solved before the cash limit existed.
  *
  * @param {CandidateLeg[]} candidates - Available legs.
  * @param {number[]} stateMinimums - Lower bound for state j's leg-dependent P&L.
- * @returns {Map<string, Constraint>} Constraints keyed "state-j" and "cap-l".
+ * @param {number | null} maxCost - Largest total linear cost in dollars, or null for no limit.
+ * @returns {Map<string, Constraint>} Constraints keyed "state-j", "cap-l" and, with a limit, "cost".
  */
-function sharedConstraints(candidates: CandidateLeg[], stateMinimums: number[]): Map<string, Constraint> {
+function sharedConstraints(
+  candidates: CandidateLeg[],
+  stateMinimums: number[],
+  maxCost: number | null,
+): Map<string, Constraint> {
   const constraints = new Map<string, Constraint>();
   stateMinimums.forEach((minimum, stateIndex) => {
     constraints.set(`state-${stateIndex}`, { min: minimum });
@@ -281,6 +302,9 @@ function sharedConstraints(candidates: CandidateLeg[], stateMinimums: number[]):
       constraints.set(`cap-${legIndex}`, { max: candidate.cap });
     }
   });
+  if (maxCost !== null) {
+    constraints.set("cost", { max: maxCost });
+  }
   return constraints;
 }
 
@@ -324,15 +348,26 @@ function readQuantities(variables: [string, number][], legCount: number): number
 
 /**
  * Stage 1: the cheapest leg quantities such that, in every state,
- * unhedged_j + sum(quantity_l * pays_lj) - totalCost >= floor.
+ * unhedged_j + sum(quantity_l * pays_lj) - totalCost >= floor, and, when a
+ * cash limit applies, totalCost <= maxCost.
  *
  * @param {CandidateLeg[]} candidates - Available legs.
  * @param {number[]} unhedged - Unhedged P&L per state.
  * @param {number} floor - Required hedged P&L in every state (negative of the loss limit, plus any repair margin).
- * @returns {number[] | null} Quantities per leg, or null when the floor cannot be met.
+ * @param {number | null} maxCost - Largest total linear cost in dollars (the cash limit less any repair margin), or null for no limit.
+ * @returns {number[] | null} Quantities per leg, or null when the floor cannot be met within the limit.
  * @throws {Error} If the solver ends in any state other than optimal or infeasible.
  */
-function solveMinimumCost(candidates: CandidateLeg[], unhedged: number[], floor: number): number[] | null {
+function solveMinimumCost(
+  candidates: CandidateLeg[],
+  unhedged: number[],
+  floor: number,
+  maxCost: number | null,
+): number[] | null {
+  if (maxCost !== null && maxCost < 0) {
+    // Costs are non-negative, so a negative limit (after a repair margin) admits no plan at all.
+    return null;
+  }
   const variables = new Map<string, Map<string, number>>();
   candidates.forEach((candidate, legIndex) => {
     variables.set(`leg-${legIndex}`, legCoefficients(candidate, legIndex));
@@ -343,6 +378,7 @@ function solveMinimumCost(candidates: CandidateLeg[], unhedged: number[], floor:
     constraints: sharedConstraints(
       candidates,
       unhedged.map((value) => floor - value),
+      maxCost,
     ),
     variables,
   };
@@ -365,12 +401,14 @@ function solveMinimumCost(candidates: CandidateLeg[], unhedged: number[], floor:
  * t = worstCaseBefore. The lift is also capped at `maxLift` when one is given:
  * there is no value in raising the worst case past the floor (plus the
  * rounding margin), and the cap keeps the program bounded even when uncapped
- * legs form an arbitrage.
+ * legs form an arbitrage. A cash limit, when given, bounds total linear cost;
+ * buying nothing always satisfies it, so the program stays feasible.
  *
  * @param {CandidateLeg[]} candidates - Available legs.
  * @param {number[]} unhedged - Unhedged P&L per state.
  * @param {number} worstCaseBefore - Minimum unhedged P&L across states.
  * @param {number | null} maxLift - Largest useful improvement of the worst case in dollars, or null for no cap.
+ * @param {number | null} maxCost - Largest total linear cost in dollars, or null for no limit. Must not be negative.
  * @returns {{ quantities: number[]; lift: number }} Quantities per leg and the solver's improvement of the worst case; lift is Infinity (with zero quantities) when uncapped and unbounded.
  * @throws {Error} If the solver ends in any other state than optimal, or unbounded despite a cap.
  */
@@ -379,6 +417,7 @@ function solveMaximumWorstCase(
   unhedged: number[],
   worstCaseBefore: number,
   maxLift: number | null,
+  maxCost: number | null,
 ): { quantities: number[]; lift: number } {
   const variables = new Map<string, Map<string, number>>();
   candidates.forEach((candidate, legIndex) => {
@@ -394,13 +433,14 @@ function solveMaximumWorstCase(
   const constraints = sharedConstraints(
     candidates,
     unhedged.map((value) => worstCaseBefore - value),
+    maxCost,
   );
   if (maxLift !== null) {
     constraints.set("lift", { max: maxLift });
   }
   const model: Model = { direction: "maximize", objective: "lift", constraints, variables };
   const solution = solve(model);
-  if (solution.status === "unbounded" && maxLift === null) {
+  if (solution.status === "unbounded" && maxLift === null && maxCost === null) {
     return { quantities: new Array<number>(candidates.length).fill(0), lift: Number.POSITIVE_INFINITY };
   }
   if (solution.status !== "optimal") {
@@ -418,6 +458,11 @@ function solveMaximumWorstCase(
  * plus one cent of fee rounding; dropping a leg below half an increment loses
  * at most half an increment of payout. Both are below increment + 1 cent, so
  * the sum of that over all candidate legs is a safe (loose) bound.
+ *
+ * The same sum also bounds how far rounding can raise total cost above the
+ * solver's linear cost: each kept leg grows by at most one increment of unit
+ * cost (below $1) plus one cent of fee rounding, and dropped or rounded-down
+ * legs only lower it. The cash-limit repair relies on this.
  *
  * @param {CandidateLeg[]} candidates - Available legs.
  * @returns {number} The bound in dollars.
@@ -477,8 +522,10 @@ interface SolveContext {
   floor: number;
   tolerance: number;
   candidates: CandidateLeg[];
-  /** Upper bound on how much rounding can lower any state's hedged P&L. */
+  /** Upper bound on how much rounding can lower any state's hedged P&L, or raise total cost. */
   roundingBound: number;
+  /** Cash limit in dollars (request.maxOutlay), or null when there is none. */
+  maxOutlay: number | null;
 }
 
 /** A plan together with whether its floor is reachable before rounding. */
@@ -522,6 +569,7 @@ function buildContext(request: HedgeRequest): SolveContext {
     tolerance: floorTolerance(request),
     candidates,
     roundingBound: maxRoundingLoss(candidates),
+    maxOutlay: request.maxOutlay ?? null,
   };
 }
 
@@ -554,6 +602,30 @@ function worstHedgedPnl(legs: HedgeLeg[], context: SolveContext): number {
 }
 
 /**
+ * Sums the cost of rounded legs exactly as `assemblePlan` reports it.
+ *
+ * @param {HedgeLeg[]} legs - Rounded legs.
+ * @returns {number} Total cost in dollars, fees included.
+ */
+function totalCostOf(legs: HedgeLeg[]): number {
+  return clean(legs.reduce((total, leg) => total + leg.cost, 0));
+}
+
+/**
+ * Says whether rounded legs fit a cash limit. The reported total must not
+ * exceed the limit; only floating-point noise of at most OUTLAY_TOLERANCE is
+ * allowed, and rounded costs are whole cents plus prices in cents, so in
+ * practice the comparison is exact.
+ *
+ * @param {HedgeLeg[]} legs - Rounded legs.
+ * @param {number | null} maxOutlay - Cash limit in dollars, or null for none.
+ * @returns {boolean} True when there is no limit or the legs cost no more than it.
+ */
+function withinOutlay(legs: HedgeLeg[], maxOutlay: number | null): boolean {
+  return maxOutlay === null || totalCostOf(legs) <= maxOutlay + OUTLAY_TOLERANCE;
+}
+
+/**
  * Assembles a plan, recomputing cost, every outcome, the worst case and the
  * expected payout from the given (already rounded) legs. Reported P&L and
  * payout figures are snapped to 12 significant digits of position value (see
@@ -566,7 +638,7 @@ function worstHedgedPnl(legs: HedgeLeg[], context: SolveContext): number {
  */
 function assemblePlan(status: HedgeStatus, legs: HedgeLeg[], context: SolveContext): HedgePlan {
   const scale = context.request.exposure.quantity * context.request.exposure.spot;
-  const totalCost = clean(legs.reduce((total, leg) => total + leg.cost, 0));
+  const totalCost = totalCostOf(legs);
   const outcomes: StateOutcome[] = context.states.map((state, stateIndex) => {
     const unhedgedPnl = snapDollars(context.unhedged[stateIndex], scale);
     const hedgePayout = clean(payoutAt(legs, state.evalPrice));
@@ -596,27 +668,42 @@ function assemblePlan(status: HedgeStatus, legs: HedgeLeg[], context: SolveConte
 }
 
 /**
- * Finds the cheapest rounded plan whose worst hedged P&L is at least `target`.
+ * Finds the cheapest rounded plan whose worst hedged P&L is at least `target`
+ * and, when `maxOutlay` is given, whose rounded total cost is at most it.
  *
- * Solves stage 1 with the target as the floor, rounds and prices the legs
- * with the real fee, and, if rounding leaves the worst case below the target,
- * re-solves with the target raised by the shortfall (growing geometrically,
- * with a final attempt at the provable rounding bound).
+ * Solves stage 1 with the target as the floor (and the limit as a cost
+ * bound), rounds and prices the legs with the real fee, and repairs what
+ * rounding breaks:
+ * - if the worst case falls below the target, the floor is raised by the
+ *   shortfall;
+ * - if the total cost rises above the limit, the cost bound given to the
+ *   solver is lowered by the overrun.
+ * Each margin grows geometrically, and the final attempt uses the provable
+ * rounding bound for both, which guarantees the rounded plan meets the target
+ * and the limit whenever that tightened program is feasible. With no limit
+ * this is exactly the floor repair loop the engine always used.
  *
  * @param {SolveContext} context - Solver context.
  * @param {number} target - Required worst hedged P&L in dollars.
- * @returns {CheapestPlanResult} The legs, or null when no rounded plan was found, and whether the target is reachable before rounding.
+ * @param {number | null} maxOutlay - Cash limit in dollars, or null for none.
+ * @returns {CheapestPlanResult} The legs, or null when no rounded plan was found, and whether the target is reachable within the limit before rounding.
  * @throws {Error} If the solver fails unexpectedly.
  */
-function cheapestPlanMeeting(context: SolveContext, target: number): CheapestPlanResult {
+function cheapestPlanMeeting(context: SolveContext, target: number, maxOutlay: number | null): CheapestPlanResult {
   let margin = 0;
   let step = REPAIR_MIN_STEP;
+  let outlayMargin = 0;
+  let outlayStep = REPAIR_MIN_STEP;
   let targetFeasible = false;
   for (let attempt = 0; attempt < MAX_REPAIR_ATTEMPTS; attempt += 1) {
     if (attempt === MAX_REPAIR_ATTEMPTS - 1) {
       margin = Math.max(margin, context.roundingBound);
+      if (maxOutlay !== null) {
+        outlayMargin = Math.max(outlayMargin, context.roundingBound);
+      }
     }
-    const quantities = solveMinimumCost(context.candidates, context.unhedged, target + margin);
+    const maxCost = maxOutlay === null ? null : maxOutlay - outlayMargin;
+    const quantities = solveMinimumCost(context.candidates, context.unhedged, target + margin, maxCost);
     if (quantities === null) {
       break;
     }
@@ -625,13 +712,60 @@ function cheapestPlanMeeting(context: SolveContext, target: number): CheapestPla
     }
     const legs = roundLegs(context.candidates, quantities, context.request.takerFeeRate);
     const shortfall = target - worstHedgedPnl(legs, context);
-    if (shortfall <= context.tolerance) {
+    const overrun = maxOutlay === null ? 0 : totalCostOf(legs) - maxOutlay;
+    if (shortfall <= context.tolerance && overrun <= OUTLAY_TOLERANCE) {
       return { legs, targetFeasible: true };
     }
-    margin += Math.max(shortfall, step);
-    step *= 2;
+    if (shortfall > context.tolerance) {
+      margin += Math.max(shortfall, step);
+      step *= 2;
+    }
+    if (overrun > OUTLAY_TOLERANCE) {
+      outlayMargin += Math.max(overrun, outlayStep);
+      outlayStep *= 2;
+    }
   }
   return { legs: null, targetFeasible };
+}
+
+/**
+ * Rounds the stage 2 (maximin) quantities into legs that fit the cash limit.
+ * When rounding quantities and fees up pushes the cost over the limit, stage
+ * 2 is solved again with the limit lowered by the overrun (growing
+ * geometrically, like the floor repair); the final attempt lowers it by the
+ * provable rounding bound, which keeps the rounded cost within the limit.
+ *
+ * @param {SolveContext} context - Solver context.
+ * @param {number[]} quantities - Stage 2 solver quantities, solved within the full limit.
+ * @param {number | null} maxLift - Lift cap passed to stage 2.
+ * @returns {HedgeLeg[]} Rounded legs within the limit; empty when none were found.
+ * @throws {Error} If the solver fails unexpectedly.
+ */
+function affordableMaximinLegs(context: SolveContext, quantities: number[], maxLift: number | null): HedgeLeg[] {
+  const { maxOutlay } = context;
+  let legs = roundLegs(context.candidates, quantities, context.request.takerFeeRate);
+  if (maxOutlay === null) {
+    return legs;
+  }
+  let outlayMargin = 0;
+  let step = REPAIR_MIN_STEP;
+  for (let attempt = 0; attempt < MAX_REPAIR_ATTEMPTS; attempt += 1) {
+    if (withinOutlay(legs, maxOutlay)) {
+      return legs;
+    }
+    outlayMargin += Math.max(totalCostOf(legs) - maxOutlay, step);
+    step *= 2;
+    if (attempt === MAX_REPAIR_ATTEMPTS - 1) {
+      outlayMargin = Math.max(outlayMargin, context.roundingBound);
+    }
+    const tightened = maxOutlay - outlayMargin;
+    if (tightened <= 0) {
+      return [];
+    }
+    const retry = solveMaximumWorstCase(context.candidates, context.unhedged, context.worstCaseBefore, maxLift, tightened);
+    legs = roundLegs(context.candidates, retry.quantities, context.request.takerFeeRate);
+  }
+  return withinOutlay(legs, maxOutlay) ? legs : [];
 }
 
 /**
@@ -651,44 +785,42 @@ function bestEffortSlack(request: HedgeRequest, lift: number): number {
 }
 
 /**
- * Runs the full optimiser and also reports whether the floor is reachable
- * before rounding (which `maxHedgeableQuantity` uses to stop its search).
+ * Runs stage 1, stage 2 and the best-effort search for a request that needs a
+ * hedge and has at least one candidate leg, with `context.maxOutlay` (when not
+ * null) as a hard bound on total cost in every program and on the rounded plan.
  *
- * @param {HedgeRequest} request - The request.
- * @returns {PlanResult} The plan and the feasibility flag.
- * @throws {RangeError} If the request is invalid.
+ * @param {SolveContext} context - Solver context; its maxOutlay is the limit applied.
+ * @returns {PlanResult} The plan and whether the floor is reachable within the limit before rounding.
  * @throws {Error} If the solver fails unexpectedly.
  */
-function planHedge(request: HedgeRequest): PlanResult {
-  const context = buildContext(request);
-  const { floor, tolerance, worstCaseBefore } = context;
+function solveWithinOutlay(context: SolveContext): PlanResult {
+  const { request, floor, tolerance, worstCaseBefore, maxOutlay } = context;
 
-  if (worstCaseBefore >= floor - tolerance) {
-    return { plan: assemblePlan("no-hedge-needed", [], context), floorFeasible: true };
-  }
-  if (context.candidates.length === 0) {
-    return { plan: assemblePlan("unhedgeable", [], context), floorFeasible: false };
-  }
-
-  const stageOne = cheapestPlanMeeting(context, floor);
+  const stageOne = cheapestPlanMeeting(context, floor, maxOutlay);
   if (stageOne.legs !== null) {
     return { plan: assemblePlan("optimal", stageOne.legs, context), floorFeasible: true };
   }
   const floorFeasible = stageOne.targetFeasible;
 
   const maxLift = floor + context.roundingBound - worstCaseBefore;
-  const { quantities, lift } = solveMaximumWorstCase(context.candidates, context.unhedged, worstCaseBefore, maxLift);
+  const { quantities, lift } = solveMaximumWorstCase(
+    context.candidates,
+    context.unhedged,
+    worstCaseBefore,
+    maxLift,
+    maxOutlay,
+  );
   if (lift <= EPSILON) {
     return { plan: assemblePlan("unhedgeable", [], context), floorFeasible };
   }
-  const maximinLegs = roundLegs(context.candidates, quantities, request.takerFeeRate);
+  const maximinLegs = affordableMaximinLegs(context, quantities, maxLift);
   if (worstHedgedPnl(maximinLegs, context) >= floor - tolerance) {
     // Only reachable when the floor is reachable before rounding but the repair loop gave up.
     return { plan: assemblePlan("optimal", maximinLegs, context), floorFeasible };
   }
 
   const slack = bestEffortSlack(request, lift);
-  const relaxed = cheapestPlanMeeting(context, worstCaseBefore + lift - slack);
+  const relaxed = cheapestPlanMeeting(context, worstCaseBefore + lift - slack, maxOutlay);
   let legs = maximinLegs;
   if (relaxed.legs !== null && worstHedgedPnl(relaxed.legs, context) > worstCaseBefore + EPSILON) {
     legs = relaxed.legs;
@@ -699,6 +831,41 @@ function planHedge(request: HedgeRequest): PlanResult {
   }
   const status: HedgeStatus = worstAfter >= floor - tolerance ? "optimal" : "best-effort";
   return { plan: assemblePlan(status, legs, context), floorFeasible };
+}
+
+/**
+ * Runs the full optimiser and also reports whether the floor is reachable
+ * within the cash limit before rounding (which `maxHedgeableQuantity` uses to
+ * stop its search).
+ *
+ * With a cash limit, the plan is first computed without it. When that plan
+ * already fits the limit it is returned unchanged, so a limit that does not
+ * bind never changes the plan, whatever its status. Otherwise the plan is
+ * computed again with the limit as a hard bound on total cost.
+ *
+ * @param {HedgeRequest} request - The request.
+ * @returns {PlanResult} The plan and the feasibility flag.
+ * @throws {RangeError} If the request is invalid.
+ * @throws {Error} If the solver fails unexpectedly.
+ */
+function planHedge(request: HedgeRequest): PlanResult {
+  const context = buildContext(request);
+  const { floor, tolerance, worstCaseBefore, maxOutlay } = context;
+
+  if (worstCaseBefore >= floor - tolerance) {
+    return { plan: assemblePlan("no-hedge-needed", [], context), floorFeasible: true };
+  }
+  if (context.candidates.length === 0) {
+    return { plan: assemblePlan("unhedgeable", [], context), floorFeasible: false };
+  }
+  if (maxOutlay === null) {
+    return solveWithinOutlay(context);
+  }
+  const unlimited = solveWithinOutlay({ ...context, maxOutlay: null });
+  if (withinOutlay(unlimited.plan.legs, maxOutlay)) {
+    return unlimited;
+  }
+  return solveWithinOutlay(context);
 }
 
 /**
@@ -722,12 +889,24 @@ function planHedge(request: HedgeRequest): PlanResult {
  *   does not improve the worst case gives `unhedgeable`.
  * - A plan labelled `optimal` always meets the floor after rounding, within
  *   `floorTolerance` (at most FLOOR_TOLERANCE dollars of floating-point noise).
+ * - Cash limit: when `request.maxOutlay` is a number, total cost (fees
+ *   included) is bounded by it in stage 1, stage 2 and the best-effort search,
+ *   and the reported, rounded `totalCost` never exceeds it (beyond
+ *   OUTLAY_TOLERANCE of floating-point noise): a rounding overrun is repaired
+ *   by lowering the bound given to the solver. A limit at or above the cost of
+ *   the plan computed without a limit returns that same plan, whatever its
+ *   status (so a limit that does not bind changes nothing). When the floor is
+ *   reachable but not within the limit, the result is `best-effort` (the
+ *   cheapest plan within the usual slack of the best worst case reachable
+ *   inside the limit) or `unhedgeable` when nothing affordable improves the
+ *   worst case. A limit of 0 buys nothing. `no-hedge-needed` does not depend
+ *   on the limit.
  * - Every number in the returned plan describes the rounded legs; P&L figures
  *   are snapped to 12 significant digits of position value.
  *
- * @param {HedgeRequest} request - Ladder, exposure, loss limit, stress price, fee rate and assumed depth.
+ * @param {HedgeRequest} request - Ladder, exposure, loss limit, stress price, fee rate, assumed depth and optional cash limit.
  * @returns {HedgePlan} The plan.
- * @throws {RangeError} If the request has out-of-range values (including a non-positive quantity or spot), unsorted strikes, invalid quotes, or the ladder has no rungs.
+ * @throws {RangeError} If the request has out-of-range values (including a non-positive quantity or spot, or a negative or non-finite maxOutlay), unsorted strikes, invalid quotes, or the ladder has no rungs.
  * @throws {Error} If the linear programming solver fails unexpectedly.
  */
 export function optimizeHedge(request: HedgeRequest): HedgePlan {
@@ -736,11 +915,13 @@ export function optimizeHedge(request: HedgeRequest): HedgePlan {
 
 /**
  * Returns the best worst-case hedged P&L the ladder can achieve for a request,
- * before rounding: the stage 2 optimum t*, with no cap. Useful for showing how
- * close a `best-effort` plan comes to the best possible.
+ * before rounding: the stage 2 optimum t*, with no cap on the lift. When the
+ * request carries a cash limit (`maxOutlay`), t* is the best worst case
+ * reachable within it. Useful for showing how close a `best-effort` plan
+ * comes to the best possible.
  *
  * @param {HedgeRequest} request - The request.
- * @returns {number} t* in dollars; the unhedged worst case when no leg is available; Infinity when uncapped legs form an arbitrage.
+ * @returns {number} t* in dollars; the unhedged worst case when no leg is available; Infinity when uncapped legs form an arbitrage and there is no cash limit.
  * @throws {RangeError} If the request is invalid.
  * @throws {Error} If the solver fails unexpectedly.
  */
@@ -749,7 +930,13 @@ export function bestAchievableWorstCase(request: HedgeRequest): number {
   if (context.candidates.length === 0) {
     return context.worstCaseBefore;
   }
-  const { lift } = solveMaximumWorstCase(context.candidates, context.unhedged, context.worstCaseBefore, null);
+  const { lift } = solveMaximumWorstCase(
+    context.candidates,
+    context.unhedged,
+    context.worstCaseBefore,
+    null,
+    context.maxOutlay,
+  );
   return context.worstCaseBefore + lift;
 }
 
@@ -767,30 +954,46 @@ export function bestAchievableWorstCase(request: HedgeRequest): number {
  *   too. Rounding (whole increments and cent fees) makes success non-monotone
  *   in size, so the answer is a size that can be hedged near the top of the
  *   feasible range, not a sharp threshold. Returns 0 when no size tried succeeds.
+ * - With `maxOutlayFraction`, each size tried also gets a cash limit that
+ *   scales with it, like the floor: maxOutlay = maxOutlayFraction * q * spot.
+ *   A size then counts as hedged only when the floor is met within that limit.
+ *   Without it, no cash limit applies and `request.maxOutlay` is ignored.
  *
- * @param {HedgeRequest} request - The request; its exposure quantity and maxLoss are replaced.
+ * @param {HedgeRequest} request - The request; its exposure quantity, maxLoss and maxOutlay are replaced.
  * @param {number} maxLossFraction - Loss limit as a fraction of position value, for example 0.02.
+ * @param {number} [maxOutlayFraction] - Cash limit as a fraction of position value, for example 0.1; omit for no limit.
  * @returns {number | null} The size, Infinity when no hedge is needed at any size, or null when depth is unlimited.
- * @throws {RangeError} If maxLossFraction is negative or not finite, or the request is invalid.
+ * @throws {RangeError} If maxLossFraction or maxOutlayFraction is negative or not finite, or the request is invalid.
  * @throws {Error} If the solver fails unexpectedly.
  */
-export function maxHedgeableQuantity(request: HedgeRequest, maxLossFraction: number): number | null {
+export function maxHedgeableQuantity(
+  request: HedgeRequest,
+  maxLossFraction: number,
+  maxOutlayFraction?: number,
+): number | null {
   if (!Number.isFinite(maxLossFraction) || maxLossFraction < 0) {
     throw new RangeError(`maxLossFraction must be a finite non-negative number, got ${maxLossFraction}`);
   }
-  const context = buildContext(request);
+  if (maxOutlayFraction !== undefined && (!Number.isFinite(maxOutlayFraction) || maxOutlayFraction < 0)) {
+    throw new RangeError(`maxOutlayFraction must be a finite non-negative number, got ${maxOutlayFraction}`);
+  }
+  // request.maxOutlay is ignored here: the cash limit, if any, comes from maxOutlayFraction.
+  const baseRequest: HedgeRequest = { ...request, maxOutlay: null };
+  const context = buildContext(baseRequest);
 
   /**
-   * Runs the optimiser at a given position size with the proportional floor.
+   * Runs the optimiser at a given position size with the proportional floor
+   * and, when a fraction is given, the proportional cash limit.
    *
    * @param {number} quantity - Position size in units of the asset.
-   * @returns {PlanResult} The plan and whether the floor is reachable before rounding.
+   * @returns {PlanResult} The plan and whether the floor is reachable within the limit before rounding.
    */
   const resultAt = (quantity: number): PlanResult =>
     planHedge({
-      ...request,
+      ...baseRequest,
       exposure: { ...request.exposure, quantity },
       maxLoss: maxLossFraction * quantity * request.exposure.spot,
+      maxOutlay: maxOutlayFraction === undefined ? null : maxOutlayFraction * quantity * request.exposure.spot,
     });
 
   /**

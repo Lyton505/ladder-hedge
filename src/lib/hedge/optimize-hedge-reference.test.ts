@@ -3,6 +3,7 @@ import {
   BEST_EFFORT_LIFT_SLACK_FRACTION,
   BEST_EFFORT_SLACK_FRACTION,
   FLOOR_TOLERANCE,
+  OUTLAY_TOLERANCE,
   optimizeHedge,
 } from "@/lib/hedge/optimize-hedge";
 import {
@@ -14,6 +15,15 @@ import type { HedgeRequest, Ladder, LadderRung } from "@/lib/hedge/types";
 
 /** Number of random requests compared with the reference solver. */
 const REFERENCE_TRIALS = 1000;
+
+/** Number of random requests compared with the reference solver under a cash limit. */
+const LIMITED_REFERENCE_TRIALS = 2000;
+
+/** Fewest limited best-effort plans that must get the per-case pin (rarer than without a limit). */
+const MIN_LIMITED_PIN_CHECKS = 40;
+
+/** Time allowed for the limited reference test, which runs two engine and several reference solves per trial. */
+const LIMITED_TEST_TIMEOUT_MS = 60_000;
 
 /** Largest acceptable median of (rounded optimal cost - continuous minimum) on 0.01-increment ladders, in dollars. */
 const MEDIAN_EXCESS_LIMIT = 0.01;
@@ -29,6 +39,12 @@ const CENT_INCREMENT = 0.01;
 
 /** Dollar tolerance for comparisons between the two solvers. */
 const SOLVER_TOLERANCE = 1e-6;
+
+/** Seed of the second generator that draws cash limits, so the requests match the unlimited test. */
+const LIMIT_SEED = 7331;
+
+/** Share of limited trials whose cash limit is zero. */
+const ZERO_LIMIT_SHARE = 0.1;
 
 /**
  * Deterministic 32-bit pseudo-random generator (mulberry32), so failures reproduce.
@@ -213,4 +229,147 @@ describe("optimizeHedge against an independent vertex-enumeration solver", () =>
 
     expect(bestEffortCostChecks).toBeGreaterThan(MIN_BEST_EFFORT_COST_CHECKS);
   });
+
+  it("agrees on feasibility, cost and worst case within a cash limit, and never exceeds the limit", () => {
+    // Same requests as the test above (same seed), each given a cash limit drawn from a second generator.
+    const random = mulberry32(5150);
+    const limitRandom = mulberry32(LIMIT_SEED);
+    const statusCounts: Record<string, number> = {};
+    let limitBindsCount = 0;
+    let bestEffortCostChecks = 0;
+    let tightAllowanceChecks = 0;
+    const limitedExcess: number[] = [];
+    for (let trial = 0; trial < LIMITED_REFERENCE_TRIALS; trial += 1) {
+      const base = randomSmallRequest(random);
+      const unlimitedModel = buildReferenceModel(base);
+      const unlimitedMinimum = referenceMinimumCost(unlimitedModel, 0);
+      const maximin = referenceMaximumWorstCase(unlimitedModel);
+      const maximinCost = maximin.quantities.reduce(
+        (total, quantity, legIndex) => total + quantity * unlimitedModel.legs[legIndex].unitCost,
+        0,
+      );
+      // Draw limits around what the plan would cost without one, so the limit often binds.
+      const scale = 1.5 * (unlimitedMinimum?.cost ?? maximinCost) + 0.05;
+      const maxOutlay = limitRandom() < ZERO_LIMIT_SHARE ? 0 : Math.round(limitRandom() * scale * 100) / 100;
+      const request: HedgeRequest = { ...base, maxOutlay };
+      const plan = optimizeHedge(request);
+      const model = buildReferenceModel(request);
+      const context = `trial ${trial}: ${JSON.stringify({ request, status: plan.status, legs: plan.legs, cost: plan.totalCost, worst: plan.worstCaseAfter })}`;
+      statusCounts[plan.status] = (statusCounts[plan.status] ?? 0) + 1;
+
+      const bound = model.roundingBound;
+      const limitedMinimum = referenceMinimumCost(model, 0);
+      const bestWithinLimit = referenceMaximumWorstCase(model).worstCase;
+      if (unlimitedMinimum !== null && limitedMinimum === null) {
+        limitBindsCount += 1;
+      }
+
+      // The limit is never exceeded, by any status.
+      expect(plan.totalCost, context).toBeLessThanOrEqual(maxOutlay + OUTLAY_TOLERANCE);
+      // A limit the plan without a limit already fits changes nothing (that plan is checked
+      // against the reference in the test above); the slack checks below apply when it binds.
+      const unlimitedPlan = optimizeHedge(base);
+      const limitBinds = unlimitedPlan.totalCost > maxOutlay + OUTLAY_TOLERANCE;
+      if (!limitBinds) {
+        expect(plan, context).toEqual(unlimitedPlan);
+      }
+      expect(plan.stressPrice, context).toBeCloseTo(model.evalPrices[0], 9);
+      expect(plan.worstCaseBefore, context).toBeCloseTo(model.worstCaseBefore, 6);
+      expect(plan.worstCaseAfter, context).toBeLessThanOrEqual(bestWithinLimit + SOLVER_TOLERANCE);
+
+      if (plan.status === "no-hedge-needed") {
+        expect(model.worstCaseBefore, context).toBeGreaterThanOrEqual(model.floor - FLOOR_TOLERANCE);
+      } else {
+        expect(model.worstCaseBefore, context).toBeLessThan(model.floor + SOLVER_TOLERANCE);
+      }
+
+      if (plan.status === "optimal") {
+        expect(limitedMinimum, context).not.toBeNull();
+        expect(plan.worstCaseAfter, context).toBeGreaterThanOrEqual(model.floor - FLOOR_TOLERANCE);
+        expect(plan.totalCost, context).toBeGreaterThanOrEqual((limitedMinimum?.cost ?? Number.NaN) - SOLVER_TOLERANCE);
+        // Same bound as without a limit: the limit only cuts off dearer plans.
+        const marginedMinimum = referenceMinimumCost(unlimitedModel, 2 * bound + 0.01);
+        if (marginedMinimum !== null) {
+          expect(plan.totalCost, context).toBeLessThanOrEqual(marginedMinimum.cost + bound + SOLVER_TOLERANCE);
+        }
+      }
+
+      if (limitedMinimum === null) {
+        expect(["best-effort", "unhedgeable"], context).toContain(plan.status);
+      } else if (plan.status === "best-effort" || plan.status === "unhedgeable") {
+        // Reachable before rounding, but only just: either the floor or the limit leaves no room
+        // for the repair margins (each below 2 * bound + 0.005).
+        expect(referenceMinimumCost(model, 2 * bound + 0.01, 2 * bound + 0.01), context).toBeNull();
+      }
+
+      if (plan.status === "best-effort" && limitBinds) {
+        const lift = bestWithinLimit - model.worstCaseBefore;
+        const slack = Math.min(
+          BEST_EFFORT_SLACK_FRACTION * request.exposure.quantity * request.exposure.spot,
+          BEST_EFFORT_LIFT_SLACK_FRACTION * lift,
+        );
+        const target = bestWithinLimit - slack;
+        expect(plan.worstCaseAfter, context).toBeGreaterThan(plan.worstCaseBefore);
+        expect(plan.worstCaseAfter, context).toBeLessThan(model.floor);
+        // Any rounded plan costs at least the continuous minimum for the worst case it achieves.
+        const achievedMinimum = referenceMinimumCost(unlimitedModel, plan.worstCaseAfter - model.floor);
+        if (achievedMinimum !== null) {
+          expect(plan.totalCost, context).toBeGreaterThanOrEqual(achievedMinimum.cost - SOLVER_TOLERANCE);
+        }
+        const targetMinimum = referenceMinimumCost(model, target - model.floor);
+        if (targetMinimum !== null && request.ladder.rungs[0].quantityIncrement === CENT_INCREMENT) {
+          limitedExcess.push(plan.totalCost - targetMinimum.cost);
+        }
+        // Slack rule against the best worst case inside the limit: whenever the reference can meet the
+        // target with room for both repair margins, the engine's search must succeed, so the plan
+        // reaches the target and costs at most that reference minimum plus the rounding bound.
+        const marginedTarget = referenceMinimumCost(model, target + 2 * bound + 0.01 - model.floor, 2 * bound + 0.01);
+        if (marginedTarget !== null) {
+          bestEffortCostChecks += 1;
+          expect(plan.worstCaseAfter, context).toBeGreaterThanOrEqual(target - SOLVER_TOLERANCE);
+          expect(plan.totalCost, context).toBeLessThanOrEqual(marginedTarget.cost + bound + SOLVER_TOLERANCE);
+        }
+        // In every case the plan comes within the slack of the best worst case reachable within the
+        // limit, or, when it falls back to the maximin plan, within the rounding bound plus what
+        // lowering the limit by the repair margin (under 2 * bound + 0.005) can cost. The best worst
+        // case is concave in the limit, so that cost is at most margin / limit * lift. With limits of
+        // a few cents this allowance is large: the cent-rounded fee is a fixed cost per leg that the
+        // linear programs cannot see.
+        const repairAllowance = maxOutlay > 0 ? ((2 * bound + 0.01) / maxOutlay) * lift : Number.POSITIVE_INFINITY;
+        expect(plan.worstCaseAfter, context).toBeGreaterThanOrEqual(
+          bestWithinLimit - Math.max(slack, bound + repairAllowance) - SOLVER_TOLERANCE,
+        );
+        if (maxOutlay > 0 && repairAllowance < bound) {
+          tightAllowanceChecks += 1;
+        }
+      }
+
+      if (plan.status === "unhedgeable") {
+        expect(plan.legs, context).toEqual([]);
+        expect(plan.totalCost, context).toBe(0);
+        // Nothing affordable helps by more than rounding can take away, unless the limit itself is
+        // below the rounding bound (a cent or two, where the cent-rounded fee alone can use it up).
+        // This is an observed property of the engine on these seeds, not a proven bound.
+        if (maxOutlay > bound) {
+          expect(bestWithinLimit - model.worstCaseBefore, context).toBeLessThanOrEqual(bound + SOLVER_TOLERANCE);
+        }
+      }
+    }
+    // Cheapness pin for limited best-effort plans on 0.01-increment ladders: the typical cost sits
+    // within cents of the reference minimum for the slack target inside the limit (median about
+    // $0.004 and 90th percentile about $0.026 on 307 plans with these seeds).
+    limitedExcess.sort((left, right) => left - right);
+    expect(limitedExcess.length).toBeGreaterThan(50);
+    expect(limitedExcess[Math.floor((limitedExcess.length - 1) / 2)]).toBeLessThan(MEDIAN_EXCESS_LIMIT);
+    expect(limitedExcess[Math.floor(0.9 * (limitedExcess.length - 1))]).toBeLessThan(NINETIETH_EXCESS_LIMIT);
+    // With these seeds (2,000 trials): 254 optimal, 1,121 best-effort, 438 unhedgeable and 187
+    // no-hedge-needed; the limit makes a reachable floor unreachable in 522 trials; 49 best-effort
+    // plans get the per-case pin and 175 get a repair allowance below the rounding bound.
+    expect(statusCounts.optimal ?? 0).toBeGreaterThan(30);
+    expect(statusCounts["best-effort"] ?? 0).toBeGreaterThan(30);
+    expect(statusCounts.unhedgeable ?? 0).toBeGreaterThan(30);
+    expect(limitBindsCount).toBeGreaterThan(30);
+    expect(bestEffortCostChecks).toBeGreaterThan(MIN_LIMITED_PIN_CHECKS);
+    expect(tightAllowanceChecks).toBeGreaterThan(MIN_BEST_EFFORT_COST_CHECKS);
+  }, LIMITED_TEST_TIMEOUT_MS);
 });

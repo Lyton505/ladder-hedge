@@ -5,6 +5,7 @@ import {
   BEST_EFFORT_SLACK_FRACTION,
   FLOOR_TOLERANCE,
   GEMINI_TAKER_FEE_RATE,
+  OUTLAY_TOLERANCE,
   bestAchievableWorstCase,
   maxHedgeableQuantity,
   optimizeHedge,
@@ -413,6 +414,153 @@ describe("best-effort plans at tight floors", () => {
   });
 });
 
+describe("cash limit (maxOutlay)", () => {
+  /**
+   * Builds the canonical fixture request at Gemini's fee: 10 SOL at 72.12, a $10 floor, unlimited depth.
+   *
+   * @param {Partial<HedgeRequest>} [overrides] - Fields to replace.
+   * @returns {HedgeRequest} The request.
+   */
+  const feeRequest = (overrides: Partial<HedgeRequest> = {}): HedgeRequest =>
+    fixtureRequest({ takerFeeRate: GEMINI_TAKER_FEE_RATE, ...overrides });
+
+  it("returns the identical plan when the limit is omitted, null, above or exactly at the unlimited cost", () => {
+    const unlimited = optimizeHedge(feeRequest());
+    expect(unlimited.status).toBe("optimal");
+    expect(unlimited.totalCost).toBe(2.6);
+    [null, 1000, 5, 2.6].forEach((maxOutlay) => {
+      expect(optimizeHedge(feeRequest({ maxOutlay }))).toEqual(unlimited);
+    });
+  });
+
+  it("returns best-effort within a $1.50 limit that is below the $2.60 the floor needs", () => {
+    const request = feeRequest({ maxOutlay: 1.5 });
+    const plan = optimizeHedge(request);
+    const bestWithinLimit = bestAchievableWorstCase(request);
+    const lift = bestWithinLimit - plan.worstCaseBefore;
+    const slack = Math.min(
+      BEST_EFFORT_SLACK_FRACTION * SOL_FIXTURE_EXPOSURE.quantity * SOL_FIXTURE_EXPOSURE.spot,
+      BEST_EFFORT_LIFT_SLACK_FRACTION * lift,
+    );
+
+    expect(plan.status).toBe("best-effort");
+    expect(plan.totalCost).toBeLessThanOrEqual(1.5);
+    expect(plan.legs.length).toBeGreaterThan(0);
+    expect(plan.worstCaseAfter).toBeGreaterThan(plan.worstCaseBefore);
+    expect(plan.worstCaseAfter).toBeLessThan(-10);
+    // The best worst case inside the limit is below the floor, and the plan keeps within the usual slack of it.
+    expect(bestWithinLimit).toBeLessThan(-10);
+    expect(plan.worstCaseAfter).toBeLessThanOrEqual(bestWithinLimit + FLOOR_TOLERANCE);
+    expect(plan.worstCaseAfter).toBeGreaterThanOrEqual(bestWithinLimit - slack - FLOOR_TOLERANCE);
+    expectConsistentOutcomes(plan);
+  });
+
+  it("never reports a plan over the limit, even when rounding up would pass it", () => {
+    // Limits from 1 cent below the unlimited cost down to a few cents: the solver spends up to the
+    // limit, so rounding quantities and fees up would pass it without the repair.
+    for (let cents = 259; cents >= 5; cents -= 7) {
+      const maxOutlay = cents / 100;
+      const plan = optimizeHedge(feeRequest({ maxOutlay }));
+      expect(plan.totalCost, `limit ${maxOutlay}`).toBeLessThanOrEqual(maxOutlay + OUTLAY_TOLERANCE);
+      expect(["best-effort", "unhedgeable"], `limit ${maxOutlay}`).toContain(plan.status);
+      expectConsistentOutcomes(plan);
+    }
+  });
+
+  it("buys nothing with a zero limit", () => {
+    const unhedgeable = optimizeHedge(feeRequest({ maxOutlay: 0 }));
+    expect(unhedgeable.status).toBe("unhedgeable");
+    expect(unhedgeable.legs).toEqual([]);
+    expect(unhedgeable.totalCost).toBe(0);
+    expect(unhedgeable.worstCaseAfter).toBe(unhedgeable.worstCaseBefore);
+
+    const noHedge = optimizeHedge(feeRequest({ maxOutlay: 0, maxLoss: 100 }));
+    expect(noHedge.status).toBe("no-hedge-needed");
+    expect(noHedge.legs).toEqual([]);
+  });
+
+  it("turns an optimal snapshot plan into best-effort when the limit is below its cost", () => {
+    const ladder = parseLadder(solEvent, "snapshot", "2026-11-20T05:09:28Z", SOL_SNAPSHOT_SPOT);
+    expect(ladder).not.toBeNull();
+    if (ladder === null) {
+      return;
+    }
+    const positionValue = 10 * SOL_SNAPSHOT_SPOT;
+    const request: HedgeRequest = {
+      ladder,
+      exposure: { asset: "SOL", quantity: 10, spot: SOL_SNAPSHOT_SPOT },
+      maxLoss: 0.015 * positionValue,
+      stressPrice: null,
+      takerFeeRate: GEMINI_TAKER_FEE_RATE,
+      assumedDepth: 100,
+    };
+    const unlimited = optimizeHedge(request);
+    expect(unlimited.status).toBe("optimal");
+    // A 10 percent limit ($71.89) does not bind: the plan is unchanged.
+    expect(optimizeHedge({ ...request, maxOutlay: 0.1 * positionValue })).toEqual(unlimited);
+
+    const limit = 0.03 * positionValue;
+    expect(unlimited.totalCost).toBeGreaterThan(limit);
+    const limited = optimizeHedge({ ...request, maxOutlay: limit });
+    expect(limited.status).toBe("best-effort");
+    expect(limited.totalCost).toBeLessThanOrEqual(limit);
+    expect(limited.worstCaseAfter).toBeGreaterThan(limited.worstCaseBefore);
+    expect(limited.worstCaseAfter).toBeLessThan(-request.maxLoss);
+    expectConsistentOutcomes(limited, 1e-6);
+  });
+
+  it("rejects a negative or non-finite limit with a RangeError", () => {
+    [-0.01, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY].forEach((maxOutlay) => {
+      expect(() => optimizeHedge(feeRequest({ maxOutlay }))).toThrow(RangeError);
+      expect(() => optimizeHedge(feeRequest({ maxOutlay }))).toThrow(/maxOutlay must be/);
+      expect(() => bestAchievableWorstCase(feeRequest({ maxOutlay }))).toThrow(RangeError);
+    });
+  });
+});
+
+describe("maxHedgeableQuantity with a cash limit", () => {
+  const request = fixtureRequest({ takerFeeRate: GEMINI_TAKER_FEE_RATE, assumedDepth: 50 });
+
+  it("ignores request.maxOutlay when no fraction is given", () => {
+    const unlimited = maxHedgeableQuantity(request, 0.02);
+    expect(maxHedgeableQuantity({ ...request, maxOutlay: 0 }, 0.02)).toBe(unlimited);
+    // Even an invalid request.maxOutlay is ignored, because no cash limit applies.
+    expect(maxHedgeableQuantity({ ...request, maxOutlay: -1 }, 0.02)).toBe(unlimited);
+  });
+
+  it("matches the unlimited answer when the limit never binds", () => {
+    expect(maxHedgeableQuantity(request, 0.02, 1)).toBe(maxHedgeableQuantity(request, 0.02));
+  });
+
+  it("returns a size hedgeable within a limit that scales with it, and no larger than without the limit", () => {
+    const fraction = 0.004;
+    const unlimited = maxHedgeableQuantity(request, 0.02) ?? 0;
+    const quantity = maxHedgeableQuantity(request, 0.02, fraction) ?? 0;
+    expect(quantity).toBeGreaterThan(0);
+    expect(quantity).toBeLessThan(unlimited);
+    const value = quantity * request.exposure.spot;
+    const plan = optimizeHedge({
+      ...request,
+      exposure: { ...request.exposure, quantity },
+      maxLoss: 0.02 * value,
+      maxOutlay: fraction * value,
+    });
+    expect(plan.status).toBe("optimal");
+    expect(plan.totalCost).toBeLessThanOrEqual(fraction * value);
+  });
+
+  it("returns 0 when the limit is zero and Infinity when no hedge is needed", () => {
+    expect(maxHedgeableQuantity(request, 0.02, 0)).toBe(0);
+    expect(maxHedgeableQuantity(request, 0.1, 0)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("rejects a negative or non-finite fraction with a RangeError", () => {
+    [-0.1, Number.NaN, Number.POSITIVE_INFINITY].forEach((fraction) => {
+      expect(() => maxHedgeableQuantity(request, 0.02, fraction)).toThrow(RangeError);
+    });
+  });
+});
+
 describe("reported numbers", () => {
   it("snaps floating-point noise out of dollar figures", () => {
     const feePlan = optimizeHedge(fixtureRequest({ takerFeeRate: 0.07 }));
@@ -595,6 +743,9 @@ function capFor(rung: LadderRung, side: "yes" | "no", assumedDepth: number | nul
 /** Number of random requests the property test checks. */
 const PROPERTY_TRIALS = 2000;
 
+/** Seed of the second generator that draws cash limits in the property test. */
+const PROPERTY_LIMIT_SEED = 4242;
+
 describe("optimizeHedge randomized properties", () => {
   it("keeps every invariant across seeded random ladders", () => {
     const random = mulberry32(20261119);
@@ -664,6 +815,57 @@ describe("optimizeHedge randomized properties", () => {
         expect(plan.worstCaseAfter, context).toBe(plan.worstCaseBefore);
       }
     }
+    expect(statusCounts.optimal ?? 0).toBeGreaterThan(20);
+    expect(statusCounts["best-effort"] ?? 0).toBeGreaterThan(20);
+  });
+
+  it("never pays more than the cash limit across the same seeded random ladders", () => {
+    // Same requests as above (same seed); limits come from a second generator so the sequence is unchanged.
+    const random = mulberry32(20261119);
+    const limitRandom = mulberry32(PROPERTY_LIMIT_SEED);
+    const statusCounts: Record<string, number> = {};
+    let binding = 0;
+    for (let trial = 0; trial < PROPERTY_TRIALS; trial += 1) {
+      const base = randomRequest(random);
+      const unlimited = optimizeHedge(base);
+      // Limits from zero to twice the unlimited cost (or up to 10 percent of value when it buys nothing).
+      const reach = unlimited.totalCost > 0 ? 2 * unlimited.totalCost : 0.1 * base.exposure.quantity * base.exposure.spot;
+      const maxOutlay = Math.round(limitRandom() * reach * 100) / 100;
+      const request: HedgeRequest = { ...base, maxOutlay };
+      let plan: HedgePlan;
+      try {
+        plan = optimizeHedge(request);
+      } catch (error) {
+        throw new Error(`trial ${trial} threw ${String(error)} for request ${JSON.stringify(request)}`);
+      }
+      const context = `trial ${trial}: ${JSON.stringify({ request, plan: { status: plan.status, legs: plan.legs, cost: plan.totalCost } })}`;
+      statusCounts[plan.status] = (statusCounts[plan.status] ?? 0) + 1;
+      if (unlimited.totalCost > maxOutlay) {
+        binding += 1;
+      }
+
+      expect(plan.totalCost, context).toBeLessThanOrEqual(maxOutlay + OUTLAY_TOLERANCE);
+      expectConsistentOutcomes(plan, 1e-9 + 1e-11 * request.exposure.quantity * request.exposure.spot);
+      if (unlimited.totalCost <= maxOutlay) {
+        // A limit that does not bind changes nothing.
+        expect(plan, context).toEqual(unlimited);
+      }
+      if (plan.status === "optimal") {
+        expect(plan.worstCaseAfter, context).toBeGreaterThanOrEqual(-request.maxLoss - FLOOR_TOLERANCE);
+      }
+      if (plan.status === "no-hedge-needed") {
+        expect(unlimited.status, context).toBe("no-hedge-needed");
+      }
+      if (plan.status === "best-effort") {
+        expect(plan.worstCaseAfter, context).toBeGreaterThan(plan.worstCaseBefore);
+        expect(plan.worstCaseAfter, context).toBeLessThan(-request.maxLoss);
+      }
+      if (plan.status === "unhedgeable") {
+        expect(plan.legs, context).toEqual([]);
+        expect(plan.worstCaseAfter, context).toBe(plan.worstCaseBefore);
+      }
+    }
+    expect(binding).toBeGreaterThan(200);
     expect(statusCounts.optimal ?? 0).toBeGreaterThan(20);
     expect(statusCounts["best-effort"] ?? 0).toBeGreaterThan(20);
   });

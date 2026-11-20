@@ -101,6 +101,8 @@ export interface HedgeRequest {
   takerFeeRate: number;
   /** Contracts assumed available per leg when the rung's size is unknown; null means unlimited. */
   assumedDepth: number | null;
+  /** Largest total cost in dollars, fees included, the plan may pay up front; null or omitted means no limit. */
+  maxOutlay?: number | null;
 }
 
 /**

@@ -31,6 +31,11 @@ export interface HedgePlanInputs {
   takerFeeRate: number;
   /** Contracts assumed per leg where the size is unknown; null means unlimited. */
   assumedDepth: number | null;
+  /**
+   * Cash limit: the most the plan may pay up front, as a fraction of position value.
+   * Null or omitted means no limit.
+   */
+  maxOutlayFraction?: number | null;
 }
 
 /** State of the largest-hedgeable-quantity computation. */
@@ -53,11 +58,20 @@ export interface HedgePlanState {
   /** True while the plan shown lags behind the latest inputs (for example during a slider drag). */
   stale: boolean;
   /**
-   * Largest quantity hedgeable to the same floor fraction; Infinity when no size needs a
-   * hedge at this floor; null when depth is unlimited somewhere or not yet known.
+   * Largest quantity hedgeable to the same floor fraction (and within the same cash-limit
+   * fraction, when one is set); Infinity when no size needs a hedge at this floor; null when
+   * depth is unlimited somewhere or not yet known.
    */
   maxHedgeable: number | null;
   maxHedgeableStatus: MaxHedgeableStatus;
+  /**
+   * The plan the same inputs give with no cash limit. Computed only when a limit is set and
+   * the plan is `best-effort` or `unhedgeable`, to tell "the floor is out of reach" from
+   * "the floor needs more cash than the limit"; null otherwise, or when it failed.
+   */
+  unlimitedPlan: HedgePlan | null;
+  /** Readable message when the plan without a limit could not be computed. */
+  unlimitedPlanError: string | null;
 }
 
 /** Engine outputs for one request. */
@@ -72,7 +86,14 @@ interface Computed {
 interface MaxHedgeableResult {
   request: HedgeRequest;
   fraction: number;
+  outlayFraction: number | null;
   value: number | null;
+  error: string | null;
+}
+
+/** Result of the comparison plan computed without a cash limit. */
+interface UnlimitedResult {
+  plan: HedgePlan | null;
   error: string | null;
 }
 
@@ -86,6 +107,9 @@ interface CoherenceResult {
 const NO_STATES: PriceState[] = [];
 const NO_POINTS: PayoffPoint[] = [];
 const NO_FINDINGS: CoherenceFinding[] = [];
+
+/** Shared "nothing computed" comparison result. */
+const NO_UNLIMITED: UnlimitedResult = { plan: null, error: null };
 
 /**
  * Formats an engine error for display.
@@ -117,18 +141,38 @@ function compute(request: HedgeRequest): Computed {
 }
 
 /**
+ * Runs the optimiser on a request with its cash limit removed, for the status copy.
+ *
+ * @param {HedgeRequest} request - The request computed with a limit.
+ * @returns {UnlimitedResult} The plan without a limit, or a readable error.
+ */
+function computeUnlimited(request: HedgeRequest): UnlimitedResult {
+  try {
+    return { plan: optimizeHedge({ ...request, maxOutlay: null }), error: null };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[use-hedge-plan] plan without a cash limit failed: ${message}`);
+    return { plan: null, error: describeEngineError(error) };
+  }
+}
+
+/**
  * Computes the hedge plan, payoff curve, price states and quote-consistency findings
  * for the current inputs, and the largest quantity the quotes can hedge to the same floor.
  *
  * The plan follows a deferred copy of the inputs so a slider drag stays responsive. The
  * largest hedgeable quantity runs about 50 optimiser solves, so it is computed only after
- * the inputs have been still for {@link MAX_HEDGEABLE_DEBOUNCE_MS}.
+ * the inputs have been still for {@link MAX_HEDGEABLE_DEBOUNCE_MS}. When a cash limit is
+ * set and the plan falls short of the floor, the plan without the limit is also computed
+ * once per deferred request (memoised), so the page can say which of the two stands in
+ * the way.
  *
  * @param {HedgePlanInputs | null} inputs - The inputs, or null while the ladder or spot is missing. Inputs
  *   with a quantity or spot that is zero, negative or not finite are treated like null.
  * @returns {HedgePlanState} The plan and derived data. Engine errors never escape: plan, payoff
- *   and price-state errors are caught into `error`, coherence errors into `coherenceError`, and
- *   largest-hedgeable errors into `maxHedgeableStatus: "error"`.
+ *   and price-state errors are caught into `error`, coherence errors into `coherenceError`,
+ *   largest-hedgeable errors into `maxHedgeableStatus: "error"`, and errors in the plan without
+ *   a limit into `unlimitedPlanError`.
  */
 export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
   const ladder = inputs?.ladder ?? null;
@@ -138,6 +182,7 @@ export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
   const fraction = inputs?.maxLossFraction ?? null;
   const takerFeeRate = inputs?.takerFeeRate ?? null;
   const assumedDepth = inputs?.assumedDepth ?? null;
+  const outlayFraction = inputs?.maxOutlayFraction ?? null;
 
   const request = useMemo<HedgeRequest | null>(() => {
     if (ladder === null || asset === null || quantity === null || spot === null || fraction === null || takerFeeRate === null) {
@@ -154,16 +199,29 @@ export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
       stressPrice: null,
       takerFeeRate,
       assumedDepth,
+      maxOutlay: outlayFraction === null ? null : outlayFraction * quantity * spot,
     };
-  }, [ladder, asset, quantity, spot, fraction, takerFeeRate, assumedDepth]);
+  }, [ladder, asset, quantity, spot, fraction, takerFeeRate, assumedDepth, outlayFraction]);
 
   const deferredRequest = useDeferredValue(request);
   const deferredFraction = useDeferredValue(fraction);
+  const deferredOutlayFraction = useDeferredValue(outlayFraction);
 
   const computed = useMemo<Computed | null>(
     () => (deferredRequest === null ? null : compute(deferredRequest)),
     [deferredRequest],
   );
+
+  const limitedStatus = computed?.plan?.status ?? null;
+  const unlimitedResult = useMemo<UnlimitedResult>(() => {
+    if (deferredRequest === null || deferredRequest.maxOutlay === null || deferredRequest.maxOutlay === undefined) {
+      return NO_UNLIMITED;
+    }
+    if (limitedStatus !== "best-effort" && limitedStatus !== "unhedgeable") {
+      return NO_UNLIMITED;
+    }
+    return computeUnlimited(deferredRequest);
+  }, [deferredRequest, limitedStatus]);
 
   const coherenceResult = useMemo<CoherenceResult>(() => {
     if (ladder === null) {
@@ -185,20 +243,24 @@ export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
       return;
     }
     const timer = setTimeout(() => {
+      const tag = { request: deferredRequest, fraction: deferredFraction, outlayFraction: deferredOutlayFraction };
       try {
-        const value = maxHedgeableQuantity(deferredRequest, deferredFraction);
-        setMaxResult({ request: deferredRequest, fraction: deferredFraction, value, error: null });
+        const value = maxHedgeableQuantity(deferredRequest, deferredFraction, deferredOutlayFraction ?? undefined);
+        setMaxResult({ ...tag, value, error: null });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[use-hedge-plan] largest hedgeable quantity failed: ${message}`);
-        setMaxResult({ request: deferredRequest, fraction: deferredFraction, value: null, error: message });
+        setMaxResult({ ...tag, value: null, error: message });
       }
     }, MAX_HEDGEABLE_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [deferredRequest, deferredFraction]);
+  }, [deferredRequest, deferredFraction, deferredOutlayFraction]);
 
   const maxCurrent =
-    maxResult !== null && maxResult.request === deferredRequest && maxResult.fraction === deferredFraction
+    maxResult !== null &&
+    maxResult.request === deferredRequest &&
+    maxResult.fraction === deferredFraction &&
+    maxResult.outlayFraction === deferredOutlayFraction
       ? maxResult
       : null;
   let maxHedgeableStatus: MaxHedgeableStatus = "idle";
@@ -221,5 +283,7 @@ export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
     stale: request !== deferredRequest,
     maxHedgeable: maxCurrent?.value ?? null,
     maxHedgeableStatus,
+    unlimitedPlan: unlimitedResult.plan,
+    unlimitedPlanError: unlimitedResult.error,
   };
 }

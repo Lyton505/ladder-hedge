@@ -91,4 +91,40 @@ describe("useHedgePlan", () => {
     // payoffCurve starts one median strike gap ($1) below the plan's stress price.
     expect(result.current.payoff[0].price).toBe(58);
   });
+
+  it("passes the cash limit to the engine and computes the plan without it only when the limit binds", () => {
+    const positionValue = SOL_FIXTURE_EXPOSURE.quantity * SOL_FIXTURE_EXPOSURE.spot;
+    const unlimited = renderHook(() => useHedgePlan(inputs({ maxLossFraction: 10 / positionValue })));
+    expect(unlimited.result.current.plan?.status).toBe("optimal");
+    expect(unlimited.result.current.planRequest?.maxOutlay).toBeNull();
+    expect(unlimited.result.current.unlimitedPlan).toBeNull();
+
+    const loose = renderHook(() =>
+      useHedgePlan(inputs({ maxLossFraction: 10 / positionValue, maxOutlayFraction: 0.1 })),
+    );
+    expect(loose.result.current.plan).toEqual(unlimited.result.current.plan);
+    expect(loose.result.current.planRequest?.maxOutlay).toBeCloseTo(0.1 * positionValue, 9);
+    expect(loose.result.current.unlimitedPlan).toBeNull();
+
+    // 0.2 percent of $721.20 is $1.44, below the $2.60 the $10 floor needs.
+    const tight = renderHook(() =>
+      useHedgePlan(inputs({ maxLossFraction: 10 / positionValue, maxOutlayFraction: 0.002 })),
+    );
+    expect(tight.result.current.plan?.status).toBe("best-effort");
+    expect(tight.result.current.plan?.totalCost).toBeLessThanOrEqual(0.002 * positionValue);
+    expect(tight.result.current.unlimitedPlan?.status).toBe("optimal");
+    expect(tight.result.current.unlimitedPlan?.totalCost).toBe(unlimited.result.current.plan?.totalCost);
+    expect(tight.result.current.unlimitedPlanError).toBeNull();
+  });
+
+  it("computes the largest hedgeable quantity within the cash-limit fraction", () => {
+    const { result } = renderHook(() => useHedgePlan(inputs({ maxLossFraction: 0.02, maxOutlayFraction: 0.004 })));
+    flushMaxHedgeable();
+    expect(result.current.maxHedgeableStatus).toBe("ready");
+    const limited = result.current.maxHedgeable ?? 0;
+    const { result: unlimitedResult } = renderHook(() => useHedgePlan(inputs({ maxLossFraction: 0.02 })));
+    flushMaxHedgeable();
+    expect(limited).toBeGreaterThan(0);
+    expect(limited).toBeLessThan(unlimitedResult.current.maxHedgeable ?? 0);
+  });
 });

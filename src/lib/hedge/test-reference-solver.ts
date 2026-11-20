@@ -37,6 +37,8 @@ export interface ReferenceModel {
   floor: number;
   /** Sum over legs of (quantityIncrement + $0.01): how much rounding can cost any state. */
   roundingBound: number;
+  /** Cash limit: largest total linear cost (fees included) in dollars, or null for no limit. */
+  maxOutlay: number | null;
 }
 
 /** Feasibility tolerance per unit of right-hand side for the vertex check. */
@@ -69,7 +71,8 @@ function referenceGap(strikes: number[]): number {
 /**
  * Builds the reference model from the plan's definitions, including the
  * stress rule from fix rounds 1 and 2: the requested stress price, else the
- * lower of (lowest strike - gap) and max(0, spot - gap).
+ * lower of (lowest strike - gap) and max(0, spot - gap). The cash limit is
+ * taken from `request.maxOutlay` (null or omitted means none).
  *
  * @param {HedgeRequest} request - The request.
  * @returns {ReferenceModel} The model.
@@ -114,6 +117,7 @@ export function buildReferenceModel(request: HedgeRequest): ReferenceModel {
     worstCaseBefore: Math.min(...unhedged),
     floor: -request.maxLoss,
     roundingBound,
+    maxOutlay: request.maxOutlay ?? null,
   };
 }
 
@@ -232,15 +236,25 @@ function vertexLp(objective: number[], rows: number[][], bounds: number[]): { va
 
 /**
  * Reference stage 1: the minimum continuous cost such that every state's
- * hedged P&L (cost included) is at least floor + margin.
+ * hedged P&L (cost included) is at least floor + margin and, when the model
+ * has a cash limit, total cost is at most that limit less `outlayMargin`.
  *
  * @param {ReferenceModel} model - The reference model.
  * @param {number} [margin] - Extra dollars added to the floor; defaults to 0.
+ * @param {number} [outlayMargin] - Dollars taken off the cash limit, if there is one; defaults to 0.
  * @returns {{ cost: number; quantities: number[] } | null} The optimum, or null when infeasible.
  */
-export function referenceMinimumCost(model: ReferenceModel, margin = 0): { cost: number; quantities: number[] } | null {
+export function referenceMinimumCost(
+  model: ReferenceModel,
+  margin = 0,
+  outlayMargin = 0,
+): { cost: number; quantities: number[] } | null {
   const legCount = model.legs.length;
   const target = model.floor + margin;
+  const budget = model.maxOutlay === null ? null : model.maxOutlay - outlayMargin;
+  if (budget !== null && budget < 0) {
+    return null;
+  }
   if (legCount === 0) {
     return model.worstCaseBefore >= target ? { cost: 0, quantities: [] } : null;
   }
@@ -262,6 +276,10 @@ export function referenceMinimumCost(model: ReferenceModel, margin = 0): { cost:
       bounds.push(-leg.cap);
     }
   });
+  if (budget !== null) {
+    rows.push(model.legs.map((leg) => -leg.unitCost));
+    bounds.push(-budget);
+  }
   const optimum = vertexLp(
     model.legs.map((leg) => -leg.unitCost),
     rows,
@@ -276,15 +294,22 @@ export function referenceMinimumCost(model: ReferenceModel, margin = 0): { cost:
 /**
  * Reference stage 2: the maximum continuous worst-case hedged P&L t, with t a
  * free variable bounded above by a generous cap so the program stays bounded.
+ * When the model has a cash limit, total cost is at most that limit less
+ * `outlayMargin` (buying nothing always qualifies while that is not negative).
  *
  * @param {ReferenceModel} model - The reference model.
+ * @param {number} [outlayMargin] - Dollars taken off the cash limit, if there is one; defaults to 0.
  * @returns {{ worstCase: number; quantities: number[] }} The best worst case and the quantities achieving it.
- * @throws {Error} If no feasible vertex exists, which cannot happen for a valid model.
+ * @throws {Error} If no feasible vertex exists, which cannot happen for a valid model with a non-negative limit.
  */
-export function referenceMaximumWorstCase(model: ReferenceModel): { worstCase: number; quantities: number[] } {
+export function referenceMaximumWorstCase(
+  model: ReferenceModel,
+  outlayMargin = 0,
+): { worstCase: number; quantities: number[] } {
   const legCount = model.legs.length;
-  if (legCount === 0) {
-    return { worstCase: model.worstCaseBefore, quantities: [] };
+  const budget = model.maxOutlay === null ? null : Math.max(0, model.maxOutlay - outlayMargin);
+  if (legCount === 0 || budget === 0) {
+    return { worstCase: model.worstCaseBefore, quantities: new Array<number>(legCount).fill(0) };
   }
   const worstCaseCap = Math.abs(model.worstCaseBefore) * 5 + Math.abs(model.floor) * 5 + 10;
   const rows: number[][] = [];
@@ -309,6 +334,10 @@ export function referenceMaximumWorstCase(model: ReferenceModel): { worstCase: n
   capRow[legCount] = -1;
   rows.push(capRow);
   bounds.push(-worstCaseCap);
+  if (budget !== null) {
+    rows.push([...model.legs.map((leg) => -leg.unitCost), 0]);
+    bounds.push(-budget);
+  }
   const objective = new Array<number>(legCount + 1).fill(0);
   objective[legCount] = 1;
   const optimum = vertexLp(objective, rows, bounds);

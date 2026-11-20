@@ -404,6 +404,7 @@ export default function PreviewPage() {
   const [maxLossFraction, setMaxLossFraction] = useState<number>(SAMPLE_MAX_LOSS_FRACTION);
   const [takerFeeRate, setTakerFeeRate] = useState<number>(SAMPLE_TAKER_FEE_RATE);
   const [assumedDepth, setAssumedDepth] = useState<number | null>(100);
+  const [maxOutlayFraction, setMaxOutlayFraction] = useState<number | null>(0.1);
   const [selectedTicker, setSelectedTicker] = useState<string>(SAMPLE_TICKER);
   const walletBalance = 12.4817;
   const positionValue = quantity * SAMPLE_SPOT;
@@ -452,6 +453,8 @@ export default function PreviewPage() {
             positionValue={positionValue}
             maxLossFraction={maxLossFraction}
             onMaxLossFractionChange={setMaxLossFraction}
+            maxOutlayFraction={maxOutlayFraction}
+            onMaxOutlayFractionChange={setMaxOutlayFraction}
             takerFeeRate={takerFeeRate}
             onTakerFeeRateChange={setTakerFeeRate}
             assumedDepth={assumedDepth}
@@ -558,6 +561,8 @@ export default function PreviewPage() {
                 positionValue={721.2}
                 maxLossFraction={0.04}
                 onMaxLossFractionChange={noop}
+                maxOutlayFraction={null}
+                onMaxOutlayFractionChange={noop}
                 takerFeeRate={0.07}
                 onTakerFeeRateChange={noop}
                 assumedDepth={null}

@@ -1,4 +1,12 @@
-import type { HedgeLeg, HedgeReceipt, Ladder, LadderRung, LadderSummary, PaperFill } from "@/lib/hedge/types";
+import type {
+  HedgeLeg,
+  HedgePlan,
+  HedgeReceipt,
+  Ladder,
+  LadderRung,
+  LadderSummary,
+  PaperFill,
+} from "@/lib/hedge/types";
 import { MEMO_HASH_PREFIX_LENGTH, parseReceiptMemo } from "@/lib/solana/receipt-memo";
 import { formatStrike, formatUsd } from "@/components/format";
 
@@ -267,6 +275,114 @@ export function classifyMaxHedgeable(value: number | null): MaxHedgeableDisplay 
     return { kind: "invalid" };
   }
   return { kind: "quantity", quantity: value };
+}
+
+/** Default cash limit: the most the page lets a plan pay up front, as a share of position value. */
+export const DEFAULT_MAX_OUTLAY_FRACTION = 0.1;
+
+/** Smallest cash limit the control offers, as a share of position value. */
+export const MIN_MAX_OUTLAY_FRACTION = 0.01;
+
+/** Largest cash limit the control offers, as a share of position value (beyond it, "No limit"). */
+export const MAX_MAX_OUTLAY_FRACTION = 0.5;
+
+/**
+ * Why a plan that falls short of the floor falls short, when a cash limit is set and
+ * makes a difference.
+ */
+export type CashLimitNote =
+  /** The floor is reachable on this ladder, but only for more cash than the limit. */
+  | { kind: "needs-more-cash"; neededOutlay: number; maxOutlay: number }
+  /** The floor is out of reach at any price, and the limit also cuts what the ladder could do. */
+  | { kind: "floor-unreachable"; maxOutlay: number; unlimitedWorstCase: number; unlimitedOutlay: number }
+  /** The plan without a limit could not be computed, so the cause is not known. */
+  | { kind: "unknown"; maxOutlay: number };
+
+/**
+ * Explains a `best-effort` or `unhedgeable` plan computed under a cash limit, by comparing
+ * it with the plan the same inputs give with no limit.
+ *
+ * @param {HedgePlan} plan - The plan computed with the limit.
+ * @param {number | null} maxOutlay - The limit in dollars, or null when none is set.
+ * @param {HedgePlan | null} unlimitedPlan - The plan with no limit, or null when it could not be computed.
+ * @returns {CashLimitNote | null} The cause, or null when no limit is set, when the plan meets the
+ *   floor or needs no hedge, or when the limit does not change the plan.
+ */
+export function cashLimitNote(
+  plan: HedgePlan,
+  maxOutlay: number | null,
+  unlimitedPlan: HedgePlan | null,
+): CashLimitNote | null {
+  if (maxOutlay === null || (plan.status !== "best-effort" && plan.status !== "unhedgeable")) {
+    return null;
+  }
+  if (unlimitedPlan === null) {
+    return { kind: "unknown", maxOutlay };
+  }
+  if (unlimitedPlan.status === "optimal") {
+    return { kind: "needs-more-cash", neededOutlay: unlimitedPlan.totalCost, maxOutlay };
+  }
+  // The engine returns the unlimited plan unchanged whenever it fits the limit, so a plan
+  // that fits means the limit changed nothing and needs no mention.
+  if (unlimitedPlan.totalCost <= maxOutlay) {
+    return null;
+  }
+  return {
+    kind: "floor-unreachable",
+    maxOutlay,
+    unlimitedWorstCase: unlimitedPlan.worstCaseAfter,
+    unlimitedOutlay: unlimitedPlan.totalCost,
+  };
+}
+
+/** The three cost figures under the headline, rounded to the cent as displayed. */
+export interface CostFigures {
+  /** Paid up front, rounded to the cent. */
+  paid: number;
+  /** Expected payout, rounded to the cent. */
+  expected: number;
+  /** paid minus expected, so the three displayed figures always agree. */
+  net: number;
+}
+
+/**
+ * Formatter used only to round to the cent exactly as `formatUsd` does. `toFixed` is not
+ * used because it rounds the exact binary value (0.015 becomes 0.01) while
+ * `Intl.NumberFormat` rounds the shortest decimal form (0.015 becomes 0.02).
+ */
+const CENT_ROUNDER = new Intl.NumberFormat("en-US", {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+  useGrouping: false,
+});
+
+/**
+ * Rounds a dollar amount to the cent the way `formatUsd` displays it.
+ *
+ * @param {number} value - Dollars.
+ * @returns {number} Dollars rounded to the cent (never -0); non-finite values are returned unchanged.
+ */
+function roundToCents(value: number): number {
+  if (!Number.isFinite(value)) {
+    return value;
+  }
+  const rounded = Number(CENT_ROUNDER.format(value));
+  return rounded === 0 ? 0 : rounded;
+}
+
+/**
+ * Builds the displayed cost figures so that net equals paid minus expected as shown:
+ * paid and expected are each rounded to the cent first, then net is their difference.
+ * Without this, tiny plans can read "paid $0.03, expected $0.02, net $0.02".
+ *
+ * @param {number} totalCost - Paid up front, in dollars.
+ * @param {number} expectedPayout - Expected payout, in dollars.
+ * @returns {CostFigures} The rounded figures.
+ */
+export function costFigures(totalCost: number, expectedPayout: number): CostFigures {
+  const paid = roundToCents(totalCost);
+  const expected = roundToCents(expectedPayout);
+  return { paid, expected, net: roundToCents(paid - expected) };
 }
 
 /** Title and body of a notice about where spot sits against the strikes. */

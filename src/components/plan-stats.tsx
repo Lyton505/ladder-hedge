@@ -1,5 +1,5 @@
 import type { HedgePlan, HedgeStatus } from "@/lib/hedge/types";
-import { classifyMaxHedgeable } from "@/lib/client/workbench-model";
+import { classifyMaxHedgeable, costFigures, type CashLimitNote } from "@/lib/client/workbench-model";
 import {
   formatCountdown,
   formatLocalDateTime,
@@ -46,6 +46,11 @@ export interface PlanStatsProps {
   depthNote?: string | null;
   /** Replaces the text shown when there is no plan and nothing is loading, for example a prompt to enter a size. */
   emptyMessage?: string | null;
+  /**
+   * Why a plan short of the floor is short when a cash limit binds (see `cashLimitNote`);
+   * null when no limit is set or it does not change the plan.
+   */
+  cashLimit?: CashLimitNote | null;
 }
 
 /** Plain-language headline and explanation for each plan status. */
@@ -55,14 +60,52 @@ interface StatusCopy {
 }
 
 /**
+ * Builds the headline and explanation for a plan that falls short of the floor while a
+ * cash limit binds. It never implies the limited plan meets the floor.
+ *
+ * @param {HedgePlan} plan - The plan computed within the limit (`best-effort` or `unhedgeable`).
+ * @param {CashLimitNote} note - Why it falls short.
+ * @returns {StatusCopy} Headline and explanation.
+ */
+function cashLimitCopy(plan: HedgePlan, note: CashLimitNote): StatusCopy {
+  const floor = formatUsd(-plan.requestedMaxLoss);
+  const limit = formatUsd(note.maxOutlay);
+  const within =
+    plan.status === "best-effort"
+      ? `This plan is the best protection within the limit: it lifts the worst case to ${formatUsd(plan.worstCaseAfter)}, short of the floor.`
+      : "Nothing within the limit improves your worst case, so there is nothing to buy.";
+  switch (note.kind) {
+    case "needs-more-cash":
+      return {
+        title: "Floor out of reach within your cash limit",
+        body: `Meeting your floor of ${floor} needs ${formatUsd(note.neededOutlay)} up front; your cash limit is ${limit}. ${within}`,
+      };
+    case "floor-unreachable":
+      return {
+        title: "Floor out of reach",
+        body: `No basket on this ladder holds every price range at ${floor}, at any price: the best it can reach is ${formatUsd(note.unlimitedWorstCase)}, for ${formatUsd(note.unlimitedOutlay)} up front. Your cash limit is ${limit}. ${within}`,
+      };
+    case "unknown":
+      return {
+        title: "Floor out of reach",
+        body: `The floor of ${floor} cannot be met within your cash limit of ${limit}, and it could not be checked whether more cash would meet it. ${within}`,
+      };
+  }
+}
+
+/**
  * Builds the status headline and explanation for a plan.
  *
  * @param {HedgeStatus} status - The plan status.
  * @param {HedgePlan} plan - The plan, for figures used in the copy.
+ * @param {CashLimitNote | null} cashLimit - Why the plan falls short when a cash limit binds, or null.
  * @returns {StatusCopy} Headline and explanation.
  */
-function statusCopy(status: HedgeStatus, plan: HedgePlan): StatusCopy {
+function statusCopy(status: HedgeStatus, plan: HedgePlan, cashLimit: CashLimitNote | null): StatusCopy {
   const floor = formatUsd(-plan.requestedMaxLoss);
+  if (cashLimit !== null && (status === "best-effort" || status === "unhedgeable")) {
+    return cashLimitCopy(plan, cashLimit);
+  }
   switch (status) {
     case "optimal":
       return {
@@ -181,6 +224,7 @@ function LossScale({ before, after, floor }: { before: number; after: number; fl
  * @param {PlanStatsProps} props - Component props.
  * @param {React.ReactNode} [props.chartSlot] - Content shown under the headline figures.
  * @param {string | null} [props.emptyMessage] - Text shown in place of the plan when there is none and nothing is loading.
+ * @param {CashLimitNote | null} [props.cashLimit] - Why the plan falls short of the floor when a cash limit binds.
  * @returns {JSX.Element} The summary.
  */
 export function PlanStats({
@@ -198,6 +242,7 @@ export function PlanStats({
   maxHedgeableNote = null,
   depthNote = null,
   emptyMessage = null,
+  cashLimit = null,
 }: PlanStatsProps) {
   if (error !== null && error !== "") {
     return (
@@ -233,9 +278,11 @@ export function PlanStats({
     );
   }
 
-  const copy = statusCopy(plan.status, plan);
+  const copy = statusCopy(plan.status, plan, cashLimit);
   const costShare = positionValue > 0 ? plan.totalCost / positionValue : Number.NaN;
-  const netExpectedCost = plan.totalCost - plan.expectedHedgePayout;
+  // Rounded to the cent as shown, so net always reads as paid minus expected.
+  const figures = costFigures(plan.totalCost, plan.expectedHedgePayout);
+  const netExpectedCost = figures.net;
   const floor = -plan.requestedMaxLoss;
   const floorMet = plan.worstCaseAfter >= floor - 0.005;
   const bottomOutcome = plan.outcomes.length > 0 ? plan.outcomes[0] : null;
@@ -282,9 +329,9 @@ export function PlanStats({
           </span>
           <dl className="figures mt-1.5 grid grid-cols-[auto_auto] justify-start gap-x-4 gap-y-0.5 text-xs">
             <dt className="text-graphite">Paid up front</dt>
-            <dd className="text-right font-semibold text-ink">{formatUsd(plan.totalCost)}</dd>
+            <dd className="text-right font-semibold text-ink">{formatUsd(figures.paid)}</dd>
             <dt className="text-graphite">Expected payout</dt>
-            <dd className="text-right font-semibold text-ink">{formatUsd(plan.expectedHedgePayout)}</dd>
+            <dd className="text-right font-semibold text-ink">{formatUsd(figures.expected)}</dd>
           </dl>
           <p className="mt-1 max-w-[34ch] text-xs leading-snug text-graphite">
             Paid up front is what leaves your account ({formatPercent(costShare)} of the position, fees

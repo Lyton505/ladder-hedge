@@ -51,8 +51,8 @@ export interface PayoffChartProps {
   strikes: number[];
   /** Asset symbol for copy, for example "SOL". */
   asset: string;
-  /** Quantity held, for copy. */
-  quantity: number;
+  /** Quantity held, for copy; null while the quantity field is blank or invalid, which keeps the caption neutral. */
+  quantity: number | null;
   /** True while the plan is being computed and no points are available yet. */
   loading?: boolean;
   /** Chart height in pixels. Defaults to 340. */
@@ -183,7 +183,9 @@ export function PayoffChart({
       <figcaption className="flex flex-col gap-1">
         <span className="stretch-semiwide text-[15px] font-semibold">Profit and loss at expiry</span>
         <span className="text-sm leading-relaxed text-graphite">
-          How the value of {quantity} {asset} changes from today
+          {quantity === null
+            ? `How the value of your ${asset} holding changes from today`
+            : `How the value of ${quantity} ${asset} changes from today`}
           {spot !== null ? ` (${formatUsd(spot)})` : ""}, by the price {asset} settles at when the
           ladder expires.
         </span>

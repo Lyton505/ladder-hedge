@@ -2,9 +2,14 @@ import { describe, expect, it } from "vitest";
 import type { HedgePlan, Ladder, LadderSummary, PaperFill } from "@/lib/hedge/types";
 import { SOL_FIXTURE_LADDER } from "@/lib/hedge/test-fixtures";
 import { optimizeHedge } from "@/lib/hedge";
+import { SOL_FIXTURE_EXPOSURE } from "@/lib/hedge/test-fixtures";
+import { formatUsd } from "@/components/format";
 import {
+  cashLimitNote,
   chooseDefaultLadder,
   classifyMaxHedgeable,
+  costFigures,
+  DEFAULT_MAX_OUTLAY_FRACTION,
   hedgeInputBlocker,
   countTwoSidedRungs,
   ladderDepthBasis,
@@ -257,5 +262,97 @@ describe("matchVerifiedSignatures", () => {
       { signature: "sig-4", memo: "hello", blockTime: null, slot: 0 },
     ];
     expect(matchVerifiedSignatures([fill], receipts)).toEqual(["sig-1"]);
+  });
+});
+
+describe("cashLimitNote", () => {
+  /**
+   * Runs the engine on the fee-0.07 fixture (10 SOL, $10 floor, unlimited depth).
+   *
+   * @param {number | null} maxOutlay - Cash limit in dollars, or null.
+   * @param {number} [maxLoss] - Loss floor in dollars; defaults to 10.
+   * @returns {HedgePlan} The plan.
+   */
+  const planWith = (maxOutlay: number | null, maxLoss = 10): HedgePlan =>
+    optimizeHedge({
+      ladder: SOL_FIXTURE_LADDER,
+      exposure: SOL_FIXTURE_EXPOSURE,
+      maxLoss,
+      stressPrice: null,
+      takerFeeRate: 0.07,
+      assumedDepth: null,
+      maxOutlay,
+    });
+
+  it("defaults the limit to 10 percent of position value", () => {
+    expect(DEFAULT_MAX_OUTLAY_FRACTION).toBe(0.1);
+  });
+
+  it("says nothing when no limit is set or the plan meets the floor", () => {
+    expect(cashLimitNote(planWith(null), null, null)).toBeNull();
+    expect(cashLimitNote(planWith(72.12), 72.12, null)).toBeNull();
+    expect(cashLimitNote(planWith(1.5, 0), null, planWith(null, 0))).toBeNull();
+  });
+
+  it("says how much cash the floor needs when only the limit stands in the way", () => {
+    const limited = planWith(1.5);
+    expect(limited.status).toBe("best-effort");
+    expect(cashLimitNote(limited, 1.5, planWith(null))).toEqual({
+      kind: "needs-more-cash",
+      neededOutlay: 2.6,
+      maxOutlay: 1.5,
+    });
+  });
+
+  it("says the floor is out of reach at any price, with what the ladder could do, when the limit also binds", () => {
+    // A $0 floor is out of reach on the fixture: the best is -$6.45 for $4.23 up front.
+    const unlimited = planWith(null, 0);
+    expect(unlimited.status).toBe("best-effort");
+    const limited = planWith(1.5, 0);
+    expect(cashLimitNote(limited, 1.5, unlimited)).toEqual({
+      kind: "floor-unreachable",
+      maxOutlay: 1.5,
+      unlimitedWorstCase: unlimited.worstCaseAfter,
+      unlimitedOutlay: unlimited.totalCost,
+    });
+  });
+
+  it("says nothing when the floor is out of reach at any price but the limit changes nothing", () => {
+    const unlimited = planWith(null, 0);
+    expect(cashLimitNote(planWith(50, 0), 50, unlimited)).toBeNull();
+  });
+
+  it("admits the cause is unknown when the plan without a limit is missing", () => {
+    expect(cashLimitNote(planWith(1.5), 1.5, null)).toEqual({ kind: "unknown", maxOutlay: 1.5 });
+  });
+});
+
+describe("costFigures", () => {
+  it("makes net equal paid minus expected as displayed on tiny plans", () => {
+    const figures = costFigures(0.034, 0.0151);
+    expect(formatUsd(figures.paid)).toBe("$0.03");
+    expect(formatUsd(figures.expected)).toBe("$0.02");
+    expect(formatUsd(figures.net)).toBe("$0.01");
+  });
+
+  it("rounds each figure exactly as formatUsd displays it", () => {
+    [0.005, 0.015, 1.005, 2.675, 0.125, 340.925, 12.3449999, -0.005, -1.235, 0].forEach((value) => {
+      expect(formatUsd(costFigures(value, 0).paid)).toBe(formatUsd(value));
+      expect(formatUsd(costFigures(0, value).expected)).toBe(formatUsd(value));
+    });
+  });
+
+  it("keeps the identity for many random pairs", () => {
+    for (let index = 0; index < 2000; index += 1) {
+      const paid = (index * 7.31) % 400;
+      const expected = (index * 3.17) % 380;
+      const figures = costFigures(paid, expected);
+      expect(formatUsd(figures.paid)).toBe(formatUsd(paid));
+      expect(formatUsd(figures.expected)).toBe(formatUsd(expected));
+      const shownNet = Number(formatUsd(figures.net).replace(/[$,]/g, ""));
+      const shownPaid = Number(formatUsd(figures.paid).replace(/[$,]/g, ""));
+      const shownExpected = Number(formatUsd(figures.expected).replace(/[$,]/g, ""));
+      expect(shownNet).toBeCloseTo(shownPaid - shownExpected, 9);
+    }
   });
 });

@@ -7,7 +7,9 @@ import { GEMINI_TAKER_FEE_RATE } from "@/lib/hedge";
 import type { Exposure, Ladder, PaperFill, SpotQuote } from "@/lib/hedge/types";
 import { describeClientError, type SnapshotMeta } from "@/lib/client/api";
 import {
+  cashLimitNote,
   countTwoSidedRungs,
+  DEFAULT_MAX_OUTLAY_FRACTION,
   hedgeInputBlocker,
   horizonLabel,
   ladderDepthBasis,
@@ -219,7 +221,7 @@ function newFillId(): string {
 }
 
 /**
- * The whole Ladder Hedge tool on one page: the holding, the ladder, the loss floor,
+ * The whole Ladder Hedge tool on one page: the holding, the ladder, the loss floor and cash limit,
  * the cheapest basket that meets it with its payoff, the ladder's quotes and implied
  * distribution, and the paper fill with its Solana devnet receipt.
  *
@@ -234,6 +236,8 @@ export function HedgeWorkbench() {
   // False while the quantity field is blank, unparseable or negative (it then keeps its last valid value).
   const [quantityDraftValid, setQuantityDraftValid] = useState<boolean>(true);
   const [maxLossFraction, setMaxLossFraction] = useState<number>(DEFAULT_MAX_LOSS_FRACTION);
+  // Cash limit as a share of position value; null means no limit.
+  const [maxOutlayFraction, setMaxOutlayFraction] = useState<number | null>(DEFAULT_MAX_OUTLAY_FRACTION);
   const [takerFeeRate, setTakerFeeRate] = useState<number>(GEMINI_TAKER_FEE_RATE);
   const [assumedDepth, setAssumedDepth] = useState<number | null>(DEFAULT_ASSUMED_DEPTH);
   const [selectedByAsset, setSelectedByAsset] = useState<Record<string, string>>({});
@@ -283,13 +287,15 @@ export function HedgeWorkbench() {
       return null;
     }
     const exposure: Exposure = { asset, quantity, spot: spotQuote.price };
-    return { ladder, exposure, maxLossFraction, takerFeeRate, assumedDepth };
-  }, [ladder, spotQuote, inputBlocker, asset, quantity, maxLossFraction, takerFeeRate, assumedDepth]);
+    return { ladder, exposure, maxLossFraction, takerFeeRate, assumedDepth, maxOutlayFraction };
+  }, [ladder, spotQuote, inputBlocker, asset, quantity, maxLossFraction, takerFeeRate, assumedDepth, maxOutlayFraction]);
 
   const hedge = useHedgePlan(inputs);
   const plan = hedge.plan;
   const planRequest = hedge.planRequest;
   const planLadder = planRequest?.ladder ?? null;
+  // Why a plan short of the floor is short, when the cash limit is what stands in the way.
+  const cashLimit = plan === null ? null : cashLimitNote(plan, planRequest?.maxOutlay ?? null, hedge.unlimitedPlan);
 
   const ladderBasis = ladder === null ? "none" : ladderDepthBasis(ladder);
   const sizesUnknown = ladderBasis === "assumed" || ladderBasis === "mixed";
@@ -424,12 +430,13 @@ export function HedgeWorkbench() {
   } else if (assumedDepth === null && sizesUnknown) {
     maxHedgeableNote = "not limited: depth is set to unlimited where Gemini publishes no size";
   }
+  const limitsNote = maxOutlayFraction === null ? "at this floor" : "at this floor and cash limit";
   const depthNote =
     ladderBasis === "measured"
-      ? "at this floor, on measured order-book sizes"
+      ? `${limitsNote}, on measured order-book sizes`
       : ladderBasis === "mixed"
-        ? "at this floor, on measured sizes plus assumed depth where none is published"
-        : "at this floor, on assumed depth";
+        ? `${limitsNote}, on measured sizes plus assumed depth where none is published`
+        : `${limitsNote}, on assumed depth`;
 
   let disabledReason: string | null = null;
   if (plan === null || planRequest === null) {
@@ -600,6 +607,8 @@ export function HedgeWorkbench() {
             positionValue={positionValue}
             maxLossFraction={maxLossFraction}
             onMaxLossFractionChange={setMaxLossFraction}
+            maxOutlayFraction={maxOutlayFraction}
+            onMaxOutlayFractionChange={setMaxOutlayFraction}
             takerFeeRate={takerFeeRate}
             onTakerFeeRateChange={setTakerFeeRate}
             assumedDepth={assumedDepth}
@@ -661,6 +670,7 @@ export function HedgeWorkbench() {
             maxHedgeableNote={maxHedgeableNote}
             depthNote={depthNote}
             emptyMessage={quantityPrompt}
+            cashLimit={cashLimit}
             chartSlot={
               planError === null && !noLadderAvailable ? (
                 <PayoffChart
@@ -669,7 +679,7 @@ export function HedgeWorkbench() {
                   spot={planRequest?.exposure.spot ?? spotQuote?.price ?? null}
                   strikes={strikes}
                   asset={asset}
-                  quantity={planRequest?.exposure.quantity ?? quantity}
+                  quantity={inputBlocker === "quantity" ? null : (planRequest?.exposure.quantity ?? quantity)}
                   loading={plan === null && quantityPrompt === null}
                 />
               ) : null

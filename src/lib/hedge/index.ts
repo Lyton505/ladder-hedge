@@ -6,6 +6,7 @@ export {
   BEST_EFFORT_SLACK_FRACTION,
   FLOOR_TOLERANCE,
   GEMINI_TAKER_FEE_RATE,
+  OUTLAY_TOLERANCE,
   bestAchievableWorstCase,
   maxHedgeableQuantity,
   optimizeHedge,
