@@ -5,6 +5,8 @@ import { formatStrike, formatUsd } from "./format";
 export interface CoherencePanelProps {
   /** Findings from the coherence check; empty when the quotes are consistent. */
   findings: CoherenceFinding[];
+  /** A readable message when the check itself failed; the findings are then not shown. */
+  error?: string | null;
 }
 
 /** Readable name and one-line explanation for each kind of finding. */
@@ -12,7 +14,7 @@ const KIND_COPY: Record<CoherenceKind, { name: string; explanation: string; exec
   arbitrage: {
     name: "Executable mispricing",
     explanation:
-      "Buying YES on the lower strike and NO on the higher one costs less than the $1 the pair is certain to pay. Fees and size can close the gap.",
+      "Buying YES on the lower strike and NO on the higher one (or both sides of one strike whose book is crossed) costs less than the $1 the pair is certain to pay, after the taker fee on both legs. Quoted size and quotes moving before a fill can still close the gap.",
     executable: true,
   },
   "bid-inversion": {
@@ -32,12 +34,14 @@ const KIND_COPY: Record<CoherenceKind, { name: string; explanation: string; exec
 /**
  * Checks the ladder's quotes against each other. A higher strike can never be
  * more likely than a lower one, so its price should never be higher. Lists any
- * pair that breaks this, and says plainly when none do.
+ * pair that breaks this, and says plainly when none do. When the check itself
+ * failed, says so instead of claiming the quotes are consistent.
  *
  * @param {CoherencePanelProps} props - Component props.
+ * @param {string | null} [props.error] - Message shown when the check failed.
  * @returns {JSX.Element} The panel.
  */
-export function CoherencePanel({ findings }: CoherencePanelProps) {
+export function CoherencePanel({ findings, error = null }: CoherencePanelProps) {
   return (
     <section aria-label="Quote consistency" className="flex flex-col gap-3">
       <div className="flex flex-col gap-1">
@@ -48,7 +52,11 @@ export function CoherencePanel({ findings }: CoherencePanelProps) {
         </p>
       </div>
 
-      {findings.length === 0 ? (
+      {error !== null && error !== "" ? (
+        <p role="alert" className="rounded-[5px] border border-alarm/30 bg-alarm-tint px-3 py-3 text-sm leading-relaxed text-ink">
+          {error}
+        </p>
+      ) : findings.length === 0 ? (
         <p className="flex items-start gap-2.5 rounded-[5px] bg-fog px-3 py-3 text-sm leading-relaxed">
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" className="mt-0.5 shrink-0 text-cobalt">
             <circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" strokeWidth="1.5" />
@@ -79,7 +87,9 @@ export function CoherencePanel({ findings }: CoherencePanelProps) {
                     </svg>
                     {copy.name}
                     <span className="figures font-normal text-graphite">
-                      {formatStrike(finding.lowerStrike)} and {formatStrike(finding.higherStrike)}
+                      {finding.lowerStrike === finding.higherStrike
+                        ? `at ${formatStrike(finding.lowerStrike)}, crossed book`
+                        : `${formatStrike(finding.lowerStrike)} and ${formatStrike(finding.higherStrike)}`}
                     </span>
                   </span>
                   <span className="figures text-sm">

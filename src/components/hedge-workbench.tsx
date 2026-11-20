@@ -8,13 +8,16 @@ import type { Exposure, Ladder, PaperFill, SpotQuote } from "@/lib/hedge/types";
 import { describeClientError, type SnapshotMeta } from "@/lib/client/api";
 import {
   countTwoSidedRungs,
+  hedgeInputBlocker,
   horizonLabel,
   ladderDepthBasis,
   ladderHorizon,
   matchVerifiedSignatures,
   MIN_TWO_SIDED_RUNGS,
   planDepthBasis,
+  QUANTITY_PROMPT,
   spotPosition,
+  spotPositionNotice,
   type DepthBasis,
 } from "@/lib/client/workbench-model";
 import { explorerTxUrl } from "@/lib/solana/constants";
@@ -228,6 +231,8 @@ export function HedgeWorkbench() {
   const nowMs = useNow();
   const [asset, setAsset] = useState<string>(DEFAULT_ASSET);
   const [typedQuantity, setTypedQuantity] = useState<number | null>(null);
+  // False while the quantity field is blank, unparseable or negative (it then keeps its last valid value).
+  const [quantityDraftValid, setQuantityDraftValid] = useState<boolean>(true);
   const [maxLossFraction, setMaxLossFraction] = useState<number>(DEFAULT_MAX_LOSS_FRACTION);
   const [takerFeeRate, setTakerFeeRate] = useState<number>(GEMINI_TAKER_FEE_RATE);
   const [assumedDepth, setAssumedDepth] = useState<number | null>(DEFAULT_ASSUMED_DEPTH);
@@ -269,15 +274,17 @@ export function HedgeWorkbench() {
   // Quantity: what the user typed, else the wallet's SOL balance, else the default.
   const walletDefault = asset === "SOL" && walletBalance !== null && walletBalance > 0 ? walletBalance : null;
   const quantity = typedQuantity ?? walletDefault ?? DEFAULT_QUANTITY;
-  const positionValue = spotQuote === null ? Number.NaN : spotQuote.price * quantity;
+  const positionValue = spotQuote === null || !quantityDraftValid ? Number.NaN : spotQuote.price * quantity;
 
+  // The engine throws on a zero, negative or non-finite quantity or spot, so it is not called with one.
+  const inputBlocker = hedgeInputBlocker(quantityDraftValid ? quantity : null, spotQuote?.price ?? null);
   const inputs = useMemo<HedgePlanInputs | null>(() => {
-    if (ladder === null || spotQuote === null) {
+    if (ladder === null || spotQuote === null || inputBlocker !== null) {
       return null;
     }
     const exposure: Exposure = { asset, quantity, spot: spotQuote.price };
     return { ladder, exposure, maxLossFraction, takerFeeRate, assumedDepth };
-  }, [ladder, spotQuote, asset, quantity, maxLossFraction, takerFeeRate, assumedDepth]);
+  }, [ladder, spotQuote, inputBlocker, asset, quantity, maxLossFraction, takerFeeRate, assumedDepth]);
 
   const hedge = useHedgePlan(inputs);
   const plan = hedge.plan;
@@ -345,21 +352,21 @@ export function HedgeWorkbench() {
       body: `It settled at ${formatLocalDateTime(ladder.expiry)}. Its contracts no longer trade, so the plan below is an illustration built from its last quotes, not something you could buy. Pick a ladder that has not expired.`,
     });
   }
-  if (ladder !== null && spotQuote !== null && position === "below" && lowestStrike !== null) {
-    notices.push({
-      id: "spot-below",
-      tone: "warning",
-      title: "Spot is below every strike on this ladder",
-      body: `${asset} is at ${formatUsd(spotQuote.price)}, under the lowest strike of ${formatStrike(lowestStrike)}. The ladder has no strike beneath spot, so it cannot protect against a further fall. Pick a ladder whose strikes surround spot.`,
-    });
-  }
-  if (ladder !== null && spotQuote !== null && position === "above" && highestStrike !== null) {
-    notices.push({
-      id: "spot-above",
-      tone: "warning",
-      title: "Spot is above every strike on this ladder",
-      body: `${asset} is at ${formatUsd(spotQuote.price)}, over the highest strike of ${formatStrike(highestStrike)}. Protection still starts only at the strikes, so the first ${formatUsd((spotQuote.price - highestStrike) * quantity)} of a fall is not hedged.`,
-    });
+  const spotNotice =
+    ladder !== null && spotQuote !== null && lowestStrike !== null && highestStrike !== null
+      ? spotPositionNotice({
+          position,
+          asset,
+          spot: spotQuote.price,
+          quantity,
+          lowestStrike,
+          highestStrike,
+          // The stress price the displayed plan used, only when that plan is for this ladder.
+          stressPrice: plan !== null && planLadder?.eventTicker === ladder.eventTicker ? plan.stressPrice : null,
+        })
+      : null;
+  if (spotNotice !== null) {
+    notices.push({ id: spotNotice.id, tone: "warning", title: spotNotice.title, body: spotNotice.body });
   }
   if (ladder !== null && ladderState.error !== null) {
     notices.push({
@@ -388,7 +395,10 @@ export function HedgeWorkbench() {
     planError = `Ladder ${selectedTicker ?? ""} could not be loaded: ${asSentence(ladderState.error)}`;
   } else if (ladder !== null && spotQuote === null && spotError !== null) {
     planError = `The ${asset} spot price is unavailable, and the hedge needs it to value your holding. ${asSentence(spotError)} It is retried every 15 seconds.`;
-  } else if (hedge.error !== null) {
+  } else if (ladder !== null && spotQuote !== null && inputBlocker === "spot") {
+    planError = `The ${asset} spot price received, ${formatUsd(spotQuote.price)}, is not a usable price, so the holding cannot be valued. It is retried every 15 seconds.`;
+  } else if (inputBlocker === null && hedge.error !== null) {
+    // With no usable quantity the engine is not called; a prompt is shown instead of an error.
     planError = hedge.error;
   }
   if (noLadderAvailable && planError === null) {
@@ -399,8 +409,10 @@ export function HedgeWorkbench() {
       body: `Gemini lists no ${asset} price ladder right now and no snapshot is stored for it, so no hedge can be computed. Pick another asset.`,
     });
   }
+  const quantityPrompt = planError === null && inputBlocker === "quantity" ? QUANTITY_PROMPT : null;
   const planLoading =
     planError === null &&
+    quantityPrompt === null &&
     plan === null &&
     (laddersState.loading || laddersState.choosingDefault || ladderState.loading || spotState.loading);
 
@@ -557,7 +569,12 @@ export function HedgeWorkbench() {
               asset={asset}
               onAssetChange={handleAssetChange}
               quantity={quantity}
-              onQuantityChange={setTypedQuantity}
+              onQuantityChange={(next) => {
+                setTypedQuantity(next);
+                setQuantityDraftValid(true);
+              }}
+              onQuantityInvalid={() => setQuantityDraftValid(false)}
+              quantityValid={quantityDraftValid}
               spot={spotQuote}
               spotLoading={!isSnapshot && spotState.loading}
               spotError={spotQuote === null ? spotError : null}
@@ -565,6 +582,7 @@ export function HedgeWorkbench() {
               onUseWalletBalance={() => {
                 if (walletBalance !== null) {
                   setTypedQuantity(walletBalance);
+                  setQuantityDraftValid(true);
                 }
               }}
               walletButton={<WalletMultiButton style={WALLET_BUTTON_STYLE} />}
@@ -630,7 +648,7 @@ export function HedgeWorkbench() {
           ) : null}
 
           <PlanStats
-            plan={planError === null ? plan : null}
+            plan={planError === null && quantityPrompt === null ? plan : null}
             positionValue={planRequest === null ? positionValue : planRequest.exposure.quantity * planRequest.exposure.spot}
             asset={asset}
             expiry={ladder?.expiry ?? null}
@@ -642,6 +660,7 @@ export function HedgeWorkbench() {
             error={planError}
             maxHedgeableNote={maxHedgeableNote}
             depthNote={depthNote}
+            emptyMessage={quantityPrompt}
             chartSlot={
               planError === null && !noLadderAvailable ? (
                 <PayoffChart
@@ -651,7 +670,7 @@ export function HedgeWorkbench() {
                   strikes={strikes}
                   asset={asset}
                   quantity={planRequest?.exposure.quantity ?? quantity}
-                  loading={plan === null}
+                  loading={plan === null && quantityPrompt === null}
                 />
               ) : null
             }
@@ -741,7 +760,7 @@ export function HedgeWorkbench() {
               </section>
               <div className="flex min-w-0 flex-col gap-10">
                 <DistributionChart states={hedge.states} spot={spotQuote?.price ?? null} asset={asset} />
-                <CoherencePanel findings={hedge.coherence} />
+                <CoherencePanel findings={hedge.coherence} error={hedge.coherenceError} />
               </div>
             </div>
           ) : null}

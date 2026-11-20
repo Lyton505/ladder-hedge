@@ -1,5 +1,6 @@
 import type { HedgeLeg, HedgeReceipt, Ladder, LadderRung, LadderSummary, PaperFill } from "@/lib/hedge/types";
 import { MEMO_HASH_PREFIX_LENGTH, parseReceiptMemo } from "@/lib/solana/receipt-memo";
+import { formatStrike, formatUsd } from "@/components/format";
 
 /**
  * Pure decisions the hedge workbench makes about ladders, depth and receipts.
@@ -210,6 +211,120 @@ export function spotPosition(ladder: Ladder, spot: number): SpotPosition | null 
     return "above";
   }
   return "inside";
+}
+
+/** Why the engine must not be called yet: no usable quantity, or no usable spot. */
+export type HedgeInputBlocker = "quantity" | "spot";
+
+/** Prompt shown in place of the plan while the quantity field is blank, zero or invalid. */
+export const QUANTITY_PROMPT = "Enter a position size above zero to see a hedge.";
+
+/**
+ * Decides whether the holding is complete enough to call the engine. The engine throws a
+ * RangeError for a quantity or spot that is zero, negative or not finite, so the page
+ * must not call it with one.
+ *
+ * @param {number | null} quantity - Quantity from the field, or null while the field is blank or invalid.
+ * @param {number | null} spot - Spot price in dollars, or null while it is loading or unavailable.
+ * @returns {HedgeInputBlocker | null} What is missing, or null when the engine can be called.
+ */
+export function hedgeInputBlocker(quantity: number | null, spot: number | null): HedgeInputBlocker | null {
+  if (quantity === null || !Number.isFinite(quantity) || quantity <= 0) {
+    return "quantity";
+  }
+  if (spot === null || !Number.isFinite(spot) || spot <= 0) {
+    return "spot";
+  }
+  return null;
+}
+
+/** How the largest hedgeable quantity should be shown. */
+export type MaxHedgeableDisplay =
+  /** No position size needs a hedge at this floor (the engine returned Infinity). */
+  | { kind: "any-size" }
+  /** A finite, non-negative size. */
+  | { kind: "quantity"; quantity: number }
+  /** Not known: depth is unlimited somewhere, or the value is not computed yet (null). */
+  | { kind: "unknown" }
+  /** A value the engine should never return (NaN, negative, -Infinity). */
+  | { kind: "invalid" };
+
+/**
+ * Classifies the largest hedgeable quantity for display, so that Infinity and other
+ * non-finite values never reach a number formatter.
+ *
+ * @param {number | null} value - The value from `maxHedgeableQuantity`, or null.
+ * @returns {MaxHedgeableDisplay} How to show it.
+ */
+export function classifyMaxHedgeable(value: number | null): MaxHedgeableDisplay {
+  if (value === null) {
+    return { kind: "unknown" };
+  }
+  if (value === Number.POSITIVE_INFINITY) {
+    return { kind: "any-size" };
+  }
+  if (!Number.isFinite(value) || value < 0) {
+    return { kind: "invalid" };
+  }
+  return { kind: "quantity", quantity: value };
+}
+
+/** Title and body of a notice about where spot sits against the strikes. */
+export interface SpotNoticeCopy {
+  id: "spot-below" | "spot-above";
+  title: string;
+  body: string;
+}
+
+/** Inputs to {@link spotPositionNotice}. */
+export interface SpotNoticeInput {
+  position: SpotPosition | null;
+  asset: string;
+  /** Spot price in dollars. */
+  spot: number;
+  /** Units held. */
+  quantity: number;
+  lowestStrike: number;
+  highestStrike: number;
+  /** The stress price the displayed plan used (`plan.stressPrice`), or null when there is no plan yet. */
+  stressPrice: number | null;
+}
+
+/**
+ * Builds the notice shown when spot sits outside the ladder's strikes, or null when it
+ * sits inside them.
+ *
+ * Below the ladder, every price under spot falls in the ladder's bottom range, so the
+ * basket can pay only a fixed amount there: the plan is still real, but it is measured
+ * down to the plan's stress price and is flat below the lowest strike. Above the
+ * ladder, no contract can tell a settlement just under spot from one at the highest
+ * strike or above.
+ *
+ * @param {SpotNoticeInput} input - Spot, the strikes and the plan's stress price.
+ * @returns {SpotNoticeCopy | null} The notice, or null when spot is inside the strikes or unknown.
+ */
+export function spotPositionNotice(input: SpotNoticeInput): SpotNoticeCopy | null {
+  const { position, asset, spot, quantity, lowestStrike, highestStrike, stressPrice } = input;
+  if (position === "below") {
+    const measured =
+      stressPrice !== null && Number.isFinite(stressPrice)
+        ? ` The plan's worst case is measured down to ${formatUsd(stressPrice)}; below that, every further dollar of decline is your loss.`
+        : " Below the price the plan is measured at, every further dollar of decline is your loss.";
+    return {
+      id: "spot-below",
+      title: "Spot is below every strike on this ladder",
+      body: `${asset} is at ${formatUsd(spot)}, under the lowest strike of ${formatStrike(lowestStrike)}. Every price below spot falls in the ladder's bottom range, where each contract pays the same fixed amount however far ${asset} falls.${measured} A ladder whose strikes surround spot can protect in steps.`,
+    };
+  }
+  if (position === "above") {
+    const gapLoss = (spot - highestStrike) * quantity;
+    return {
+      id: "spot-above",
+      title: "Spot is above every strike on this ladder",
+      body: `${asset} is at ${formatUsd(spot)}, over the highest strike of ${formatStrike(highestStrike)}. Every contract pays the same whether ${asset} settles just under spot or at ${formatStrike(highestStrike)}, so the ladder cannot tell those apart. The worst case already counts a fall to ${formatStrike(highestStrike)}, a loss of ${formatUsd(gapLoss)}. A ladder whose strikes surround spot can protect in steps.`,
+    };
+  }
+  return null;
 }
 
 /**

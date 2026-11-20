@@ -1,4 +1,5 @@
 import type { HedgePlan, HedgeStatus } from "@/lib/hedge/types";
+import { classifyMaxHedgeable } from "@/lib/client/workbench-model";
 import {
   formatCountdown,
   formatLocalDateTime,
@@ -22,7 +23,10 @@ export interface PlanStatsProps {
   nowMs: number | null;
   /** The ladder's lowest strike, where protection stops; null when unknown. */
   lowestStrike: number | null;
-  /** Largest quantity the quotes can hedge to this floor, or null when depth is unlimited or unknown. */
+  /**
+   * Largest quantity the quotes can hedge to this floor; Infinity when no size needs a
+   * hedge at this floor; null when depth is unlimited or unknown.
+   */
   maxHedgeableQuantity: number | null;
   /** True when the hedgeable quantity rests on an assumed depth rather than published sizes. */
   depthAssumed: boolean;
@@ -40,6 +44,8 @@ export interface PlanStatsProps {
   maxHedgeableNote?: string | null;
   /** Replaces the "on assumed depth" / "on quoted sizes" caption under the largest hedgeable quantity. */
   depthNote?: string | null;
+  /** Replaces the text shown when there is no plan and nothing is loading, for example a prompt to enter a size. */
+  emptyMessage?: string | null;
 }
 
 /** Plain-language headline and explanation for each plan status. */
@@ -167,11 +173,14 @@ function LossScale({ before, after, floor }: { before: number; after: number; fl
 
 /**
  * The plan in numbers. Leads with the three figures that decide it (worst case
- * without the hedge, worst case with it, and what it costs), then supporting
- * figures and the limit of the protection below the lowest strike.
+ * without the hedge, worst case with it, and the net expected cost: the up-front
+ * outlay minus the payout expected at the ladder's market-implied odds, with both
+ * shown beneath it), then supporting figures and the limit of the protection
+ * below the lowest strike.
  *
  * @param {PlanStatsProps} props - Component props.
  * @param {React.ReactNode} [props.chartSlot] - Content shown under the headline figures.
+ * @param {string | null} [props.emptyMessage] - Text shown in place of the plan when there is none and nothing is loading.
  * @returns {JSX.Element} The summary.
  */
 export function PlanStats({
@@ -188,6 +197,7 @@ export function PlanStats({
   chartSlot = null,
   maxHedgeableNote = null,
   depthNote = null,
+  emptyMessage = null,
 }: PlanStatsProps) {
   if (error !== null && error !== "") {
     return (
@@ -202,7 +212,7 @@ export function PlanStats({
     return (
       <section aria-live="polite" className="@container flex flex-col gap-4">
         <div className="grid grid-cols-1 gap-6 @2xl:grid-cols-3">
-          {["Worst case without a hedge", "Worst case with the hedge", "Cost of the hedge"].map((label) => (
+          {["Worst case without a hedge", "Worst case with the hedge", "Net expected cost"].map((label) => (
             <div key={label} className="flex flex-col gap-2">
               <span className="text-sm text-graphite">{label}</span>
               <span
@@ -214,7 +224,9 @@ export function PlanStats({
         <p className="text-sm text-graphite">
           {loading
             ? "Finding the cheapest basket for your floor"
-            : "Choose a ladder and enter your holding to see the hedge."}
+            : emptyMessage !== null && emptyMessage !== ""
+              ? emptyMessage
+              : "Choose a ladder and enter your holding to see the hedge."}
         </p>
         {chartSlot}
       </section>
@@ -228,11 +240,12 @@ export function PlanStats({
   const floorMet = plan.worstCaseAfter >= floor - 0.005;
   const bottomOutcome = plan.outcomes.length > 0 ? plan.outcomes[0] : null;
   const countdown = expiry !== null && nowMs !== null ? formatCountdown(expiry, nowMs) : null;
+  const maxHedgeable = classifyMaxHedgeable(maxHedgeableQuantity);
   // Large positions (BTC) produce figures like -$17,611.55 that overflow at the largest size.
   const longestFigure = Math.max(
     formatUsd(plan.worstCaseBefore).length,
     formatUsd(plan.worstCaseAfter).length,
-    formatUsd(plan.totalCost).length,
+    formatUsd(netExpectedCost).length,
   );
   const figureSize =
     longestFigure > 8 ? "text-[1.75rem] @3xl:text-[2.125rem]" : "text-[2.5rem] @3xl:text-5xl";
@@ -263,13 +276,24 @@ export function PlanStats({
           </span>
         </div>
         <div className="flex flex-col gap-1 @2xl:border-l @2xl:border-rule @2xl:pl-8">
-          <span className="text-sm text-graphite">Cost of the hedge</span>
+          <span className="text-sm text-graphite">Net expected cost</span>
           <span className={`figures stretch-wide ${figureSize} font-bold leading-none tracking-tight text-ink`}>
-            {formatUsd(plan.totalCost)}
+            {formatUsd(netExpectedCost)}
           </span>
-          <span className="figures text-xs text-graphite">
-            {formatPercent(costShare)} of position, fees included
-          </span>
+          <dl className="figures mt-1.5 grid grid-cols-[auto_auto] justify-start gap-x-4 gap-y-0.5 text-xs">
+            <dt className="text-graphite">Paid up front</dt>
+            <dd className="text-right font-semibold text-ink">{formatUsd(plan.totalCost)}</dd>
+            <dt className="text-graphite">Expected payout</dt>
+            <dd className="text-right font-semibold text-ink">{formatUsd(plan.expectedHedgePayout)}</dd>
+          </dl>
+          <p className="mt-1 max-w-[34ch] text-xs leading-snug text-graphite">
+            Paid up front is what leaves your account ({formatPercent(costShare)} of the position, fees
+            included). Expected payout weights each contract by the ladder&apos;s own market-implied odds;
+            it is not a forecast.
+            {netExpectedCost < -0.005
+              ? " Below zero only because these asks sit under those odds; it is not a gain you can count on."
+              : ""}
+          </p>
         </div>
         <div className="@2xl:col-span-2">
           <LossScale before={plan.worstCaseBefore} after={plan.worstCaseAfter} floor={floor} />
@@ -284,23 +308,13 @@ export function PlanStats({
 
       {chartSlot}
 
-      <dl className="figures grid grid-cols-2 gap-x-6 gap-y-4 border-y border-rule py-4 text-sm @2xl:grid-cols-4">
-        <div className="flex flex-col gap-0.5">
-          <dt className="text-graphite">Expected hedge payout</dt>
-          <dd className="text-base font-semibold">{formatUsd(plan.expectedHedgePayout)}</dd>
-          <dd className="text-xs text-graphite">weighted by implied odds</dd>
-        </div>
-        <div className="flex flex-col gap-0.5">
-          <dt className="text-graphite">Net expected cost</dt>
-          <dd className="text-base font-semibold">{formatUsd(netExpectedCost)}</dd>
-          <dd className="text-xs text-graphite">cost minus expected payout</dd>
-        </div>
+      <dl className="figures grid grid-cols-2 gap-x-6 gap-y-4 border-y border-rule py-4 text-sm">
         <div className="flex flex-col gap-0.5">
           <dt className="text-graphite">Largest position hedgeable</dt>
-          {maxHedgeableQuantity !== null ? (
+          {maxHedgeable.kind === "quantity" ? (
             <>
               <dd className="text-base font-semibold">
-                {formatQuantity(maxHedgeableQuantity)} {asset}
+                {formatQuantity(maxHedgeable.quantity)} {asset}
               </dd>
               <dd className="text-xs text-graphite">
                 {depthNote !== null && depthNote !== ""
@@ -310,11 +324,18 @@ export function PlanStats({
                     : "at this floor, on quoted sizes"}
               </dd>
             </>
+          ) : maxHedgeable.kind === "any-size" ? (
+            <>
+              <dd className="text-base font-semibold">Any size</dd>
+              <dd className="text-xs text-graphite">no hedge is needed at this floor</dd>
+            </>
           ) : (
             <dd className="text-sm leading-snug text-graphite">
               {maxHedgeableNote !== null && maxHedgeableNote !== ""
                 ? maxHedgeableNote
-                : "not known: depth is unlimited or unknown"}
+                : maxHedgeable.kind === "invalid"
+                  ? "could not be computed for this ladder"
+                  : "not known: depth is unlimited or unknown"}
             </dd>
           )}
         </div>

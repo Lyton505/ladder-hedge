@@ -14,6 +14,8 @@ export interface NumberFieldProps {
   value: number | null;
   /** Called with a valid value in model units whenever the text parses and is in range. */
   onCommit: (value: number) => void;
+  /** Optional: called whenever the text becomes blank, unparseable or out of range. */
+  onInvalid?: () => void;
   /** Smallest accepted value in display units. Defaults to 0. */
   min?: number;
   /** Largest accepted value in display units. Defaults to unbounded. */
@@ -65,6 +67,7 @@ export function NumberField({
   id,
   value,
   onCommit,
+  onInvalid,
   min = 0,
   max = Number.POSITIVE_INFINITY,
   scale = 1,
@@ -90,7 +93,7 @@ export function NumberField({
   const isInvalid = parsed === null || parsed < min || parsed > max;
 
   /**
-   * Stores the new draft and reports it when valid.
+   * Stores the new draft and reports it when valid, or reports that it is not.
    *
    * @param {string} text - The new input text.
    * @returns {void}
@@ -100,6 +103,8 @@ export function NumberField({
     const next = parseDraftNumber(text);
     if (next !== null && next >= min && next <= max) {
       onCommit(next / scale);
+    } else if (onInvalid !== undefined) {
+      onInvalid();
     }
   }
 

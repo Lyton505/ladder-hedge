@@ -18,6 +18,10 @@ export interface ExposurePanelProps {
   quantity: number;
   /** Called with a new valid quantity as the user types. */
   onQuantityChange: (quantity: number) => void;
+  /** Optional: called when the quantity text becomes blank, unparseable or negative. */
+  onQuantityInvalid?: () => void;
+  /** False while the quantity field holds no usable size above zero; the position value then shows a dash. Defaults to true. */
+  quantityValid?: boolean;
   /** Current spot quote, or null when not yet known. */
   spot: SpotQuote | null;
   /** True while the spot price is loading. */
@@ -64,6 +68,8 @@ export function ExposurePanel({
   onAssetChange,
   quantity,
   onQuantityChange,
+  onQuantityInvalid,
+  quantityValid = true,
   spot,
   spotLoading = false,
   spotError = null,
@@ -77,7 +83,7 @@ export function ExposurePanel({
   const walletHelpId = `${baseId}-wallet-help`;
   const blocker = walletActionBlocker(asset, walletBalance);
   const spotIsSnapshot = spot !== null && spot.source.toLowerCase().includes("snapshot");
-  const positionValue = spot !== null ? spot.price * quantity : null;
+  const positionValue = spot !== null && quantityValid ? spot.price * quantity : null;
 
   return (
     <section aria-labelledby={`${baseId}-heading`} className="flex flex-col gap-5">
@@ -123,6 +129,7 @@ export function ExposurePanel({
           id={quantityId}
           value={quantity}
           onCommit={onQuantityChange}
+          onInvalid={onQuantityInvalid}
           min={0}
           suffix={asset}
           describedBy={walletHelpId}

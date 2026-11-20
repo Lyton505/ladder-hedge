@@ -44,12 +44,18 @@ export interface HedgePlanState {
   /** Price states with implied probabilities, for the distribution chart. */
   states: PriceState[];
   payoff: PayoffPoint[];
+  /** Quote-consistency findings, with arbitrage edges net of the taker fee in the inputs. */
   coherence: CoherenceFinding[];
+  /** Readable message when the coherence check rejected the ladder; `coherence` is then empty and means nothing. */
+  coherenceError: string | null;
   /** Readable message when the engine rejected the inputs. */
   error: string | null;
   /** True while the plan shown lags behind the latest inputs (for example during a slider drag). */
   stale: boolean;
-  /** Largest quantity hedgeable to the same floor fraction, or null when depth is unlimited somewhere or not yet known. */
+  /**
+   * Largest quantity hedgeable to the same floor fraction; Infinity when no size needs a
+   * hedge at this floor; null when depth is unlimited somewhere or not yet known.
+   */
   maxHedgeable: number | null;
   maxHedgeableStatus: MaxHedgeableStatus;
 }
@@ -67,6 +73,12 @@ interface MaxHedgeableResult {
   request: HedgeRequest;
   fraction: number;
   value: number | null;
+  error: string | null;
+}
+
+/** Result of the quote-consistency check. */
+interface CoherenceResult {
+  findings: CoherenceFinding[];
   error: string | null;
 }
 
@@ -112,8 +124,11 @@ function compute(request: HedgeRequest): Computed {
  * largest hedgeable quantity runs about 50 optimiser solves, so it is computed only after
  * the inputs have been still for {@link MAX_HEDGEABLE_DEBOUNCE_MS}.
  *
- * @param {HedgePlanInputs | null} inputs - The inputs, or null while the ladder or spot is missing.
- * @returns {HedgePlanState} The plan and derived data. Engine errors are caught into `error`.
+ * @param {HedgePlanInputs | null} inputs - The inputs, or null while the ladder or spot is missing. Inputs
+ *   with a quantity or spot that is zero, negative or not finite are treated like null.
+ * @returns {HedgePlanState} The plan and derived data. Engine errors never escape: plan, payoff
+ *   and price-state errors are caught into `error`, coherence errors into `coherenceError`, and
+ *   largest-hedgeable errors into `maxHedgeableStatus: "error"`.
  */
 export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
   const ladder = inputs?.ladder ?? null;
@@ -126,6 +141,10 @@ export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
 
   const request = useMemo<HedgeRequest | null>(() => {
     if (ladder === null || asset === null || quantity === null || spot === null || fraction === null || takerFeeRate === null) {
+      return null;
+    }
+    // The engine throws on a zero, negative or non-finite size or spot; callers show a prompt instead.
+    if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(spot) || spot <= 0) {
       return null;
     }
     return {
@@ -146,17 +165,18 @@ export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
     [deferredRequest],
   );
 
-  const coherence = useMemo<CoherenceFinding[]>(() => {
+  const coherenceResult = useMemo<CoherenceResult>(() => {
     if (ladder === null) {
-      return NO_FINDINGS;
+      return { findings: NO_FINDINGS, error: null };
     }
     try {
-      return checkCoherence(ladder);
+      return { findings: checkCoherence(ladder, takerFeeRate ?? undefined), error: null };
     } catch (error) {
-      console.error(`[use-hedge-plan] coherence check failed: ${error instanceof Error ? error.message : String(error)}`);
-      return NO_FINDINGS;
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[use-hedge-plan] coherence check failed: ${message}`);
+      return { findings: NO_FINDINGS, error: `The quotes could not be checked against each other: ${message}` };
     }
-  }, [ladder]);
+  }, [ladder, takerFeeRate]);
 
   const [maxResult, setMaxResult] = useState<MaxHedgeableResult | null>(null);
 
@@ -195,7 +215,8 @@ export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
     planRequest: computed !== null && computed.plan !== null ? deferredRequest : null,
     states: computed?.states ?? NO_STATES,
     payoff: computed?.payoff ?? NO_POINTS,
-    coherence,
+    coherence: coherenceResult.findings,
+    coherenceError: coherenceResult.error,
     error: computed?.error ?? null,
     stale: request !== deferredRequest,
     maxHedgeable: maxCurrent?.value ?? null,
