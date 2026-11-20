@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+/*
+ * Ladder Hedge theme tokens.
+ *
+ * One light theme: a cool fog ground, white paper for results, slate ink for
+ * text, and a single cobalt accent reserved for the hedge (the hedged line, the
+ * hedged worst case, the primary action). Alarm red is used only for errors.
+ */
+@theme {
+  --color-fog: #eceff2;
+  --color-fog-deep: #e1e6eb;
+  --color-paper: #ffffff;
+  --color-ink: #142033;
+  --color-graphite: #566173;
+  --color-mist: #8a94a3;
+  --color-rule: #d4dae1;
+  --color-cobalt: #2741c4;
+  --color-cobalt-deep: #1c3199;
+  --color-cobalt-tint: #e8ecfb;
+  --color-alarm: #a1301f;
+  --color-alarm-tint: #fbedea;
+}
+
+@theme inline {
+  --font-sans: var(--font-archivo), ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Archivo's width axis carries the hierarchy: wide for figures, narrow for labels. */
+@utility stretch-wide {
+  font-stretch: 125%;
+}
+
+@utility stretch-semiwide {
+  font-stretch: 112%;
+}
+
+@utility stretch-narrow {
+  font-stretch: 85%;
+}
+
+@utility figures {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  background: var(--color-fog);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-cobalt);
+  outline-offset: 2px;
+}
+
+input[type="range"],
+input[type="checkbox"] {
+  accent-color: var(--color-cobalt);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
