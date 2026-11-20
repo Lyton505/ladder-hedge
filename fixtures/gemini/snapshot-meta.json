@@ -1,0 +1,53 @@
+{
+  "description": "Captured Gemini prediction-market ladder events. Entries are listed in preference order: the first entry for an asset is its default snapshot. referenceSpot is the asset's spot at capture time; when spotIsEstimated is true it was not observed but estimated as the strike where the mid-implied survival crosses 0.5 (linear interpolation between adjacent two-sided rungs).",
+  "snapshots": [
+    {
+      "ticker": "SOL2611202200",
+      "file": "sol-2611202200.json",
+      "capturedAt": "2026-11-20T05:09:28Z",
+      "referenceSpot": 71.8915,
+      "spotIsEstimated": false,
+      "spotSource": "Gemini SOLUSD pubticker bid/ask mid at capture (bid 71.891, ask 71.892)"
+    },
+    {
+      "ticker": "BTC2611202200",
+      "file": "btc-2611202200.json",
+      "capturedAt": "2026-11-20T05:09:28Z",
+      "referenceSpot": 61414.085,
+      "spotIsEstimated": false,
+      "spotSource": "Gemini BTCUSD pubticker bid/ask mid at capture (bid 61414.08, ask 61414.09)"
+    },
+    {
+      "ticker": "ETH2611202200",
+      "file": "eth-2611202200.json",
+      "capturedAt": "2026-11-20T05:09:28Z",
+      "referenceSpot": 1720.175,
+      "spotIsEstimated": false,
+      "spotSource": "Gemini ETHUSD pubticker bid/ask mid at capture (bid 1720.00, ask 1720.35)"
+    },
+    {
+      "ticker": "SOL2611200500",
+      "file": "sol-2611200500.json",
+      "capturedAt": "2026-11-20T04:44:00Z",
+      "referenceSpot": 72.12,
+      "spotIsEstimated": false,
+      "spotSource": "Gemini SOLUSD spot observed at capture"
+    },
+    {
+      "ticker": "BTC2611200500",
+      "file": "btc-2611200500.json",
+      "capturedAt": "2026-11-20T04:44:00Z",
+      "referenceSpot": 61497.87,
+      "spotIsEstimated": true,
+      "spotSource": "Estimated from the ladder: survival crosses 0.5 between the 61,400 and 61,500 strikes"
+    },
+    {
+      "ticker": "ETH2611200500",
+      "file": "eth-2611200500.json",
+      "capturedAt": "2026-11-20T04:44:00Z",
+      "referenceSpot": 1727.33,
+      "spotIsEstimated": true,
+      "spotSource": "Estimated from the ladder: survival crosses 0.5 between the 1,720 and 1,740 strikes"
+    }
+  ]
+}
