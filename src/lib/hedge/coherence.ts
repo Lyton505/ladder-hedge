@@ -1,3 +1,5 @@
+import { assertValidLadder } from "@/lib/hedge/ladder-validation";
+import { GEMINI_TAKER_FEE_RATE } from "@/lib/hedge/optimize-hedge";
 import type { CoherenceFinding, CoherenceKind, Ladder } from "@/lib/hedge/types";
 
 /** Digits kept when removing floating-point noise from price differences. */
@@ -48,11 +50,36 @@ function finding(kind: CoherenceKind, lowerStrike: number, higherStrike: number,
 }
 
 /**
+ * Formats a per-pair edge with enough precision to show fee effects, for example "$0.0159".
+ *
+ * @param {number} edge - Edge in dollars per contract pair.
+ * @returns {string} The formatted edge.
+ */
+function formatEdge(edge: number): string {
+  return `$${edge.toFixed(4)}`;
+}
+
+/**
+ * Computes the unrounded Gemini taker fee for one contract.
+ *
+ * @param {number} rate - Taker fee rate.
+ * @param {number} price - Purchase price of the contract in dollars.
+ * @returns {number} rate * price * (1 - price).
+ */
+function perContractFee(rate: number, price: number): number {
+  return rate * price * (1 - price);
+}
+
+/**
  * Flags quotes on a ladder that contradict each other.
  *
- * - `arbitrage`: for any rungs i < k with yesAsk_i < yesBid_k, buying YES at
- *   the lower strike and NO at the higher strike costs under $1 before fees
- *   and pays at least $1 at every expiry price. Edge: yesBid_k - yesAsk_i.
+ * - `arbitrage`: for any rungs i <= k with yesAsk_i < yesBid_k, buying YES at
+ *   strike i and NO at strike k pays at least $1 at every expiry price (exactly
+ *   $1 when i = k, a crossed book on one rung). It is reported only when the
+ *   edge net of taker fees on both legs is positive, using the unrounded
+ *   per-contract fee rate * price * (1 - price) on each leg's own purchase
+ *   price (YES at yesAsk_i, NO at 1 - yesBid_k). `edge` is that net figure;
+ *   `detail` gives gross and net.
  * - `bid-inversion`: adjacent rungs where the higher strike's YES bid exceeds
  *   the lower strike's. Edge: the difference.
  * - `ask-inversion`: the same for YES asks.
@@ -61,27 +88,44 @@ function finding(kind: CoherenceKind, lowerStrike: number, higherStrike: number,
  * sorted with arbitrage first, then by edge, largest first.
  *
  * @param {Ladder} ladder - The ladder, rungs sorted ascending by strike.
+ * @param {number} [takerFeeRate] - Taker fee rate used for the net arbitrage edge; defaults to Gemini's 0.07.
  * @returns {CoherenceFinding[]} The findings; empty when the quotes are coherent.
+ * @throws {RangeError} If the fee rate is invalid, strikes are not strictly increasing, or a quote or size is not a valid number.
  */
-export function checkCoherence(ladder: Ladder): CoherenceFinding[] {
+export function checkCoherence(ladder: Ladder, takerFeeRate: number = GEMINI_TAKER_FEE_RATE): CoherenceFinding[] {
+  if (!Number.isFinite(takerFeeRate) || takerFeeRate < 0 || takerFeeRate >= 1) {
+    throw new RangeError(`takerFeeRate must be in [0, 1), got ${takerFeeRate}`);
+  }
+  assertValidLadder(ladder);
   const findings: CoherenceFinding[] = [];
   const rungs = ladder.rungs;
 
   for (let lowerIndex = 0; lowerIndex < rungs.length; lowerIndex += 1) {
     const lower = rungs[lowerIndex];
-    for (let higherIndex = lowerIndex + 1; higherIndex < rungs.length; higherIndex += 1) {
+    for (let higherIndex = lowerIndex; higherIndex < rungs.length; higherIndex += 1) {
       const higher = rungs[higherIndex];
       if (lower.yesAsk === null || higher.yesBid === null || !(lower.yesAsk < higher.yesBid)) {
         continue;
       }
+      const yesPrice = lower.yesAsk;
       const noPrice = 1 - higher.yesBid;
+      const grossEdge = higher.yesBid - yesPrice;
+      const netEdge = grossEdge - perContractFee(takerFeeRate, yesPrice) - perContractFee(takerFeeRate, noPrice);
+      if (cleanEdge(netEdge) <= 0) {
+        continue;
+      }
+      const isSameRung = lowerIndex === higherIndex;
+      const opening = isSameRung
+        ? `The book at ${formatStrike(lower.strike)} is crossed: buying YES for ${formatPrice(yesPrice)} and NO for ${formatPrice(noPrice)}`
+        : `Buying YES at ${formatStrike(lower.strike)} for ${formatPrice(yesPrice)} and NO at ${formatStrike(higher.strike)} for ${formatPrice(noPrice)}`;
+      const payoff = isSameRung ? "pays exactly $1.00" : "pays at least $1.00";
       findings.push(
         finding(
           "arbitrage",
           lower.strike,
           higher.strike,
-          higher.yesBid - lower.yesAsk,
-          `Buying YES at ${formatStrike(lower.strike)} for ${formatPrice(lower.yesAsk)} and NO at ${formatStrike(higher.strike)} for ${formatPrice(noPrice)} costs ${formatPrice(lower.yesAsk + noPrice)} before fees and pays at least $1.00 at any expiry price.`,
+          netEdge,
+          `${opening} costs ${formatPrice(yesPrice + noPrice)} before fees and ${payoff} at any expiry price, a gross edge of ${formatEdge(grossEdge)} per pair and ${formatEdge(netEdge)} after taker fees.`,
         ),
       );
     }

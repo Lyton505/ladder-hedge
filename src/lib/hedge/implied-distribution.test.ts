@@ -65,6 +65,18 @@ describe("impliedDistribution", () => {
     expect(distribution.survival).toEqual([]);
     expect(distribution.bucketProbabilities).toEqual([1]);
   });
+
+  it("throws a RangeError instead of returning NaN buckets for bad quotes or unsorted strikes", () => {
+    const nanBid: Ladder = { ...SOL_FIXTURE_LADDER, rungs: [makeFixtureRung(100, Number.NaN, 0.5)] };
+    expect(() => impliedDistribution(nanBid)).toThrow(/yesBid/);
+    const aboveOne: Ladder = { ...SOL_FIXTURE_LADDER, rungs: [makeFixtureRung(100, 0.5, 1.5)] };
+    expect(() => impliedDistribution(aboveOne)).toThrow(RangeError);
+    const unsorted: Ladder = {
+      ...SOL_FIXTURE_LADDER,
+      rungs: [makeFixtureRung(110, 0.2, 0.3), makeFixtureRung(100, 0.8, 0.9)],
+    };
+    expect(() => impliedDistribution(unsorted)).toThrow(RangeError);
+  });
 });
 
 describe("medianStrikeGap", () => {

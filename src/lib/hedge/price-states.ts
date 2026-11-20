@@ -1,5 +1,6 @@
 import { impliedDistribution, medianStrikeGap } from "@/lib/hedge/implied-distribution";
-import type { Ladder, LegSide, PriceState } from "@/lib/hedge/types";
+import { assertValidLadder } from "@/lib/hedge/ladder-validation";
+import type { Exposure, Ladder, LegSide, PriceState } from "@/lib/hedge/types";
 
 /**
  * Returns the default evaluation price for state 0 (below the lowest strike):
@@ -16,6 +17,29 @@ export function defaultStressPrice(ladder: Ladder): number {
   }
   const strikes = ladder.rungs.map((rung) => rung.strike);
   return strikes[0] - medianStrikeGap(strikes);
+}
+
+/**
+ * Resolves the evaluation price for state 0 that the optimiser uses.
+ *
+ * A supplied stress price is used as given. Otherwise the stress price is the
+ * lower of `defaultStressPrice(ladder)` and one median strike gap below spot.
+ * The second term matters when spot is already below the ladder: without it
+ * every evaluation price would sit above spot and the holder would wrongly
+ * appear to gain in every state.
+ *
+ * @param {Ladder} ladder - The ladder, rungs sorted ascending by strike.
+ * @param {Exposure} exposure - The holding; only its spot is used.
+ * @param {number | null} stressPrice - The requested stress price, or null for the default.
+ * @returns {number} The stress price to pass to `buildPriceStates`.
+ * @throws {RangeError} If the ladder has no rungs.
+ */
+export function resolveStressPrice(ladder: Ladder, exposure: Exposure, stressPrice: number | null): number {
+  if (stressPrice !== null) {
+    return stressPrice;
+  }
+  const strikes = ladder.rungs.map((rung) => rung.strike);
+  return Math.min(defaultStressPrice(ladder), exposure.spot - medianStrikeGap(strikes));
 }
 
 /**
@@ -44,12 +68,13 @@ export function legPaysAtPrice(side: LegSide, strike: number, price: number): bo
  * @param {Ladder} ladder - The ladder, rungs sorted ascending by strike.
  * @param {number | null} stressPrice - Evaluation price for state 0, or null for the default.
  * @returns {PriceState[]} One state per interval, indexed 0..n.
- * @throws {RangeError} If the ladder has no rungs, or the stress price is not finite or is at or above the lowest strike.
+ * @throws {RangeError} If the ladder has no rungs, strikes are not strictly increasing, a quote is invalid, or the stress price is not finite or is at or above the lowest strike.
  */
 export function buildPriceStates(ladder: Ladder, stressPrice: number | null): PriceState[] {
   if (ladder.rungs.length === 0) {
     throw new RangeError("Cannot build price states for a ladder with no rungs");
   }
+  assertValidLadder(ladder);
   const strikes = ladder.rungs.map((rung) => rung.strike);
   const lowestStrike = strikes[0];
   const resolvedStress = stressPrice === null ? defaultStressPrice(ladder) : stressPrice;

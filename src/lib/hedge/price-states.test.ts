@@ -1,6 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { buildPriceStates, defaultStressPrice, legPaysAtPrice } from "@/lib/hedge/price-states";
-import { SOL_FIXTURE_LADDER, makeFixtureRung } from "@/lib/hedge/test-fixtures";
+import { buildPriceStates, defaultStressPrice, legPaysAtPrice, resolveStressPrice } from "@/lib/hedge/price-states";
+import { SOL_FIXTURE_EXPOSURE, SOL_FIXTURE_LADDER, makeFixtureRung } from "@/lib/hedge/test-fixtures";
+
+describe("resolveStressPrice", () => {
+  it("keeps the ladder default when spot is inside the ladder", () => {
+    expect(resolveStressPrice(SOL_FIXTURE_LADDER, SOL_FIXTURE_EXPOSURE, null)).toBe(67);
+  });
+
+  it("moves one gap below spot when spot is below the ladder", () => {
+    expect(resolveStressPrice(SOL_FIXTURE_LADDER, { ...SOL_FIXTURE_EXPOSURE, spot: 60 }, null)).toBe(59);
+    expect(resolveStressPrice(SOL_FIXTURE_LADDER, { ...SOL_FIXTURE_EXPOSURE, spot: 66.5 }, null)).toBe(65.5);
+  });
+
+  it("uses a supplied stress price as given", () => {
+    expect(resolveStressPrice(SOL_FIXTURE_LADDER, { ...SOL_FIXTURE_EXPOSURE, spot: 60 }, 64)).toBe(64);
+  });
+});
 
 describe("defaultStressPrice", () => {
   it("is the lowest strike minus the median gap", () => {
@@ -47,6 +62,19 @@ describe("buildPriceStates", () => {
       rungs: SOL_FIXTURE_LADDER.rungs.map((rung) => ({ ...rung, yesBid: null, yesAsk: null })),
     };
     expect(buildPriceStates(ladder, null)).toHaveLength(9);
+  });
+
+  it("throws a RangeError unless strikes are strictly increasing", () => {
+    const duplicate = { ...SOL_FIXTURE_LADDER, rungs: [makeFixtureRung(70, 0.9, 0.95), makeFixtureRung(70, 0.8, 0.85)] };
+    const reversed = { ...SOL_FIXTURE_LADDER, rungs: [makeFixtureRung(75, 0.1, 0.2), makeFixtureRung(70, 0.8, 0.85)] };
+    expect(() => buildPriceStates(duplicate, null)).toThrow(RangeError);
+    expect(() => buildPriceStates(reversed, null)).toThrow(/strictly increasing/);
+  });
+
+  it("throws a RangeError for an empty ladder or a non-finite quote", () => {
+    expect(() => buildPriceStates({ ...SOL_FIXTURE_LADDER, rungs: [] }, null)).toThrow(RangeError);
+    const nanAsk = { ...SOL_FIXTURE_LADDER, rungs: [makeFixtureRung(70, 0.5, Number.NaN)] };
+    expect(() => buildPriceStates(nanAsk, null)).toThrow(/yesAsk/);
   });
 });
 

@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { parseLadder } from "@/lib/gemini/parse-ladder";
 import {
+  BEST_EFFORT_SLACK_FRACTION,
   FLOOR_TOLERANCE,
   GEMINI_TAKER_FEE_RATE,
+  bestAchievableWorstCase,
   maxHedgeableQuantity,
   optimizeHedge,
 } from "@/lib/hedge/optimize-hedge";
@@ -13,6 +16,14 @@ import {
   withFixtureRungs,
 } from "@/lib/hedge/test-fixtures";
 import type { HedgePlan, HedgeRequest, Ladder, LadderRung } from "@/lib/hedge/types";
+import btcEvent from "../../../fixtures/gemini/btc-2611200500.json";
+import solEvent from "../../../fixtures/gemini/sol-2611202200.json";
+
+/** Spot recorded with the BTC2611200500 snapshot (fixtures/gemini/snapshot-meta.json). */
+const BTC_SNAPSHOT_SPOT = 61497.87;
+
+/** Spot recorded with the default SOL2611202200 snapshot (fixtures/gemini/snapshot-meta.json). */
+const SOL_SNAPSHOT_SPOT = 71.8915;
 
 /**
  * Builds a request on the fixture ladder with zero fees and unlimited depth, then applies overrides.
@@ -228,6 +239,190 @@ describe("maxHedgeableQuantity", () => {
   it("returns 0 when even tiny positions cannot be hedged", () => {
     const ladder = withFixtureRungs((rung) => ({ ...rung, yesBid: null }));
     expect(maxHedgeableQuantity(fixtureRequest({ ladder, assumedDepth: 50 }), 0.02)).toBe(0);
+  });
+
+  it("returns Infinity when no position size needs a hedge at the floor", () => {
+    // Stress 67 vs spot 72.12 loses 7.1 percent of value, so a 10 percent floor never binds.
+    expect(maxHedgeableQuantity(fixtureRequest({ assumedDepth: 100, takerFeeRate: 0.07 }), 0.1)).toBe(
+      Number.POSITIVE_INFINITY,
+    );
+    expect(maxHedgeableQuantity(fixtureRequest({ assumedDepth: null }), 0.1)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("returns Infinity on the BTC snapshot at a 1.5 percent floor instead of 1e9", () => {
+    const ladder = parseLadder(btcEvent, "snapshot", "2026-11-20T04:44:00Z", BTC_SNAPSHOT_SPOT);
+    expect(ladder).not.toBeNull();
+    if (ladder === null) {
+      return;
+    }
+    const request: HedgeRequest = {
+      ladder,
+      exposure: { asset: "BTC", quantity: 1, spot: BTC_SNAPSHOT_SPOT },
+      maxLoss: 0,
+      stressPrice: null,
+      takerFeeRate: GEMINI_TAKER_FEE_RATE,
+      assumedDepth: 100,
+    };
+    expect(maxHedgeableQuantity(request, 0.015)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("finds a hedgeable size above small sizes that fail on fee rounding (fee 0.07, depth 100, 0.8 percent)", () => {
+    const request = fixtureRequest({ takerFeeRate: GEMINI_TAKER_FEE_RATE, assumedDepth: 100 });
+
+    /**
+     * Runs the optimiser at a size with the 0.8 percent proportional floor.
+     *
+     * @param {number} size - Position size in SOL.
+     * @returns {HedgePlan} The plan.
+     */
+    const planAt = (size: number): HedgePlan =>
+      optimizeHedge({
+        ...request,
+        exposure: { ...request.exposure, quantity: size },
+        maxLoss: 0.008 * size * request.exposure.spot,
+      });
+
+    // Rounding makes success non-monotone in size: small sizes fail, mid sizes pass.
+    expect(planAt(1).status).not.toBe("optimal");
+    expect(planAt(8).status).toBe("optimal");
+    expect(planAt(50).status).toBe("optimal");
+
+    const quantity = maxHedgeableQuantity(request, 0.008) ?? 0;
+    expect(quantity).toBeGreaterThanOrEqual(50);
+    expect(Number.isFinite(quantity)).toBe(true);
+    expect(planAt(quantity).status).toBe("optimal");
+    expect(planAt(2 * quantity).status).not.toBe("optimal");
+  });
+
+  it("returns a size that is actually hedgeable at fee 0.07 for several floors", () => {
+    const request = fixtureRequest({ takerFeeRate: GEMINI_TAKER_FEE_RATE, assumedDepth: 50 });
+    [0.015, 0.02, 0.03].forEach((fraction) => {
+      const quantity = maxHedgeableQuantity(request, fraction) ?? 0;
+      expect(quantity).toBeGreaterThan(0);
+      const plan = optimizeHedge({
+        ...request,
+        exposure: { ...request.exposure, quantity },
+        maxLoss: fraction * quantity * request.exposure.spot,
+      });
+      expect(plan.status).toBe("optimal");
+    });
+  });
+});
+
+describe("optimizeHedge when spot is below the ladder", () => {
+  it.each([
+    [60, 59],
+    [66.5, 65.5],
+  ])("hedges a holder at spot %s with stress price %s instead of reporting no hedge needed", (spot, stress) => {
+    const plan = optimizeHedge(fixtureRequest({ exposure: { ...SOL_FIXTURE_EXPOSURE, spot }, maxLoss: 1 }));
+
+    expect(plan.status).not.toBe("no-hedge-needed");
+    expect(plan.stressPrice).toBeCloseTo(stress, 12);
+    expect(plan.worstCaseBefore).toBeCloseTo(10 * (stress - spot), 9);
+    expect(plan.worstCaseBefore).toBeLessThan(0);
+    expect(plan.status).toBe("optimal");
+    expect(plan.legs.length).toBeGreaterThan(0);
+    plan.legs.forEach((leg) => {
+      expect(leg.side).toBe("no");
+    });
+    expect(plan.worstCaseAfter).toBeGreaterThanOrEqual(-1 - FLOOR_TOLERANCE);
+    expectConsistentOutcomes(plan);
+  });
+
+  it("keeps the ladder default stress price when spot is inside the ladder", () => {
+    const plan = optimizeHedge(fixtureRequest());
+    expect(plan.stressPrice).toBe(67);
+    expect(plan.worstCaseBefore).toBe(-51.2);
+  });
+});
+
+describe("best-effort plans at tight floors", () => {
+  it("does not spend dollars for cents on the default SOL snapshot at a 0.5 percent floor", () => {
+    const ladder = parseLadder(solEvent, "snapshot", "2026-11-20T05:09:28Z", SOL_SNAPSHOT_SPOT);
+    expect(ladder).not.toBeNull();
+    if (ladder === null) {
+      return;
+    }
+    const positionValue = 10 * SOL_SNAPSHOT_SPOT;
+    const request: HedgeRequest = {
+      ladder,
+      exposure: { asset: "SOL", quantity: 10, spot: SOL_SNAPSHOT_SPOT },
+      maxLoss: 0.005 * positionValue,
+      stressPrice: null,
+      takerFeeRate: GEMINI_TAKER_FEE_RATE,
+      assumedDepth: 100,
+    };
+    const plan = optimizeHedge(request);
+    const bestWorstCase = bestAchievableWorstCase(request);
+
+    expect(plan.status).toBe("best-effort");
+    // The pure maximin plan cost $130.55 for a worst case of -9.465 (review A, finding 4).
+    expect(plan.totalCost).toBeLessThan(70);
+    expect(plan.worstCaseAfter).toBeLessThanOrEqual(bestWorstCase + FLOOR_TOLERANCE);
+    expect(plan.worstCaseAfter).toBeGreaterThanOrEqual(
+      bestWorstCase - BEST_EFFORT_SLACK_FRACTION * positionValue - FLOOR_TOLERANCE,
+    );
+    expectConsistentOutcomes(plan);
+  });
+
+  it("exports the best-effort slack as 0.1 percent of position value", () => {
+    expect(BEST_EFFORT_SLACK_FRACTION).toBe(0.001);
+  });
+});
+
+describe("reported numbers", () => {
+  it("snaps floating-point noise out of dollar figures", () => {
+    const feePlan = optimizeHedge(fixtureRequest({ takerFeeRate: 0.07 }));
+
+    expect(feePlan.worstCaseBefore).toBe(-51.2);
+    expect(feePlan.worstCaseAfter).toBe(-10);
+    expect(feePlan.totalCost).toBe(2.6);
+    feePlan.outcomes.forEach((outcome) => {
+      expect(Number(outcome.hedgedPnl.toFixed(9))).toBe(outcome.hedgedPnl);
+      expect(Number(outcome.unhedgedPnl.toFixed(9))).toBe(outcome.unhedgedPnl);
+    });
+  });
+});
+
+describe("input validation", () => {
+  it.each([
+    ["yesBid", Number.NaN],
+    ["yesBid", 1.2],
+    ["yesAsk", -0.1],
+    ["yesAsk", Number.POSITIVE_INFINITY],
+    ["yesBidSize", Number.NaN],
+    ["yesAskSize", -5],
+  ] as const)("rejects %s = %s with a RangeError naming the rung and field", (field, value) => {
+    const ladder = withFixtureRungs((rung) => (rung.strike === 70 ? { ...rung, [field]: value } : rung));
+    expect(() => optimizeHedge(fixtureRequest({ ladder }))).toThrow(RangeError);
+    expect(() => optimizeHedge(fixtureRequest({ ladder }))).toThrow(new RegExp(`strike 70\\): ${field} must be`));
+    expect(() => maxHedgeableQuantity(fixtureRequest({ ladder, assumedDepth: 50 }), 0.02)).toThrow(RangeError);
+  });
+
+  it("rejects non-finite exposure and loss values", () => {
+    expect(() => optimizeHedge(fixtureRequest({ maxLoss: Number.NaN }))).toThrow(RangeError);
+    expect(() =>
+      optimizeHedge(fixtureRequest({ exposure: { ...SOL_FIXTURE_EXPOSURE, spot: Number.NaN } })),
+    ).toThrow(RangeError);
+    expect(() =>
+      optimizeHedge(fixtureRequest({ exposure: { ...SOL_FIXTURE_EXPOSURE, quantity: Number.POSITIVE_INFINITY } })),
+    ).toThrow(RangeError);
+  });
+
+  it("rejects unsorted, duplicate and empty ladders with a RangeError", () => {
+    const duplicate: Ladder = {
+      ...SOL_FIXTURE_LADDER,
+      rungs: [makeFixtureRung(70, 0.9, 0.95), makeFixtureRung(70, 0.8, 0.85)],
+    };
+    const reversed: Ladder = { ...SOL_FIXTURE_LADDER, rungs: [...SOL_FIXTURE_LADDER.rungs].reverse() };
+    const empty: Ladder = { ...SOL_FIXTURE_LADDER, rungs: [] };
+
+    [duplicate, reversed, empty].forEach((ladder) => {
+      expect(() => optimizeHedge(fixtureRequest({ ladder }))).toThrow(RangeError);
+      expect(() => maxHedgeableQuantity(fixtureRequest({ ladder, assumedDepth: 50 }), 0.02)).toThrow(RangeError);
+      expect(() => bestAchievableWorstCase(fixtureRequest({ ladder }))).toThrow(RangeError);
+    });
+    expect(() => optimizeHedge(fixtureRequest({ ladder: reversed }))).toThrow(/strictly increasing/);
   });
 });
 

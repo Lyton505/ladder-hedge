@@ -1,3 +1,4 @@
+import { assertValidLadder } from "@/lib/hedge/ladder-validation";
 import type { ImpliedDistribution, Ladder, LadderRung } from "@/lib/hedge/types";
 
 /** Fraction of the strike used as the gap for a one-rung ladder (so the stress price is 0.99 * K1). */
@@ -157,8 +158,10 @@ function clampUnit(value: number): number {
  *
  * @param {Ladder} ladder - The ladder, rungs sorted ascending by strike.
  * @returns {ImpliedDistribution} Survival per strike and n + 1 bucket probabilities summing to 1.
+ * @throws {RangeError} If strikes are not strictly increasing or a quote or size is not a valid number.
  */
 export function impliedDistribution(ladder: Ladder): ImpliedDistribution {
+  assertValidLadder(ladder);
   const strikes = ladder.rungs.map((rung) => rung.strike);
   if (strikes.length === 0) {
     return { strikes: [], survival: [], bucketProbabilities: [1] };
