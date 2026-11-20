@@ -23,8 +23,16 @@ export interface ReceiptPanelProps {
   fills: PaperFill[];
   /** Receipts read back from Solana devnet, newest first. */
   receipts: HedgeReceipt[];
-  /** Signatures of on-chain receipts whose memo hash matches a local fill. */
+  /**
+   * Signatures of on-chain receipts this browser recorded: a saved fill stores the same
+   * signature, and the memo's ladder and plan-hash prefix match that fill.
+   */
   verifiedSignatures: readonly string[];
+  /**
+   * Signatures of on-chain receipts whose memo matches a saved plan but that no saved fill
+   * recorded. They are shown as unverified.
+   */
+  unrecordedSignatures?: readonly string[];
   /** Builds the explorer link for a transaction signature. */
   explorerTxUrl: (signature: string) => string;
   /** True while receipts are being read from chain. */
@@ -33,15 +41,30 @@ export interface ReceiptPanelProps {
   receiptsError?: string | null;
 }
 
+/** How a receipt compares with the fills saved here. */
+type HashCheckState = "verified" | "unrecorded" | "unmatched";
+
 /**
- * Marks whether an on-chain receipt's plan hash matches a fill saved here.
+ * Marks whether an on-chain receipt was recorded by this browser for a saved fill.
  *
- * @param {{ verified: boolean }} props - Component props.
- * @param {boolean} props.verified - True when the hash matches.
+ * @param {{ state: HashCheckState }} props - Component props.
+ * @param {HashCheckState} props.state - verified when a saved fill recorded this transaction and its
+ *   memo matches; unrecorded when the memo matches a saved plan but no saved fill recorded this
+ *   transaction; unmatched otherwise.
  * @returns {JSX.Element} The indicator.
  */
-function HashCheck({ verified }: { verified: boolean }) {
-  if (verified) {
+function HashCheck({ state }: { state: HashCheckState }) {
+  if (state === "unrecorded") {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs text-graphite">
+        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+          <circle cx="6" cy="6" r="5" fill="none" stroke="currentColor" strokeWidth="1.2" strokeDasharray="2 1.6" />
+        </svg>
+        Not verified: memo matches a saved plan but was not recorded by this browser
+      </span>
+    );
+  }
+  if (state === "verified") {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-cobalt-deep">
         <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
@@ -91,6 +114,7 @@ export function ReceiptPanel({
   fills,
   receipts,
   verifiedSignatures,
+  unrecordedSignatures = [],
   explorerTxUrl,
   receiptsLoading = false,
   receiptsError = null,
@@ -183,7 +207,7 @@ export function ReceiptPanel({
                           >
                             Devnet receipt {formatShortHash(fill.signature)}
                           </a>
-                          <HashCheck verified={verified} />
+                          <HashCheck state={verified ? "verified" : "unmatched"} />
                         </>
                       ) : (
                         <span className="text-xs text-graphite">Saved in this browser only, no receipt</span>
@@ -235,7 +259,15 @@ export function ReceiptPanel({
                     </span>
                   </div>
                   <code className="break-all text-xs text-graphite">{receipt.memo}</code>
-                  <HashCheck verified={verifiedSignatures.includes(receipt.signature)} />
+                  <HashCheck
+                    state={
+                      verifiedSignatures.includes(receipt.signature)
+                        ? "verified"
+                        : unrecordedSignatures.includes(receipt.signature)
+                          ? "unrecorded"
+                          : "unmatched"
+                    }
+                  />
                 </li>
               ))}
             </ul>

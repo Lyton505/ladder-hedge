@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { GEMINI_TAKER_FEE_RATE } from "@/lib/hedge";
 import type { Exposure, Ladder, PaperFill, SpotQuote } from "@/lib/hedge/types";
-import { describeClientError, type SnapshotMeta } from "@/lib/client/api";
+import { describeClientError, isSnapshotTicker, type SnapshotMeta } from "@/lib/client/api";
 import {
   cashLimitNote,
   countTwoSidedRungs,
@@ -14,7 +14,7 @@ import {
   horizonLabel,
   ladderDepthBasis,
   ladderHorizon,
-  matchVerifiedSignatures,
+  matchReceipts,
   MIN_TWO_SIDED_RUNGS,
   planDepthBasis,
   QUANTITY_PROMPT,
@@ -120,17 +120,19 @@ interface NoticeItem {
   tone: NoticeTone;
   title: string;
   body: string;
+  /** Optional button shown after the text. */
+  action?: { label: string; onClick: () => void };
 }
 
 /**
  * A boxed message above the results.
  *
- * @param {{ notice: NoticeItem; action?: React.ReactNode }} props - Component props.
- * @param {NoticeItem} props.notice - What to say.
- * @param {React.ReactNode} [props.action] - Optional button after the text.
+ * @param {{ notice: NoticeItem }} props - Component props.
+ * @param {NoticeItem} props.notice - What to say, and an optional button.
  * @returns {JSX.Element} The notice.
  */
-function Notice({ notice, action }: { notice: NoticeItem; action?: React.ReactNode }) {
+function Notice({ notice }: { notice: NoticeItem }) {
+  const { action } = notice;
   const toneClass =
     notice.tone === "error"
       ? "border-alarm/30 bg-alarm-tint"
@@ -144,7 +146,17 @@ function Notice({ notice, action }: { notice: NoticeItem; action?: React.ReactNo
     >
       <p className={`font-semibold ${notice.tone === "error" ? "text-alarm" : "text-ink"}`}>{notice.title}</p>
       <p className="text-ink">{notice.body}</p>
-      {action !== undefined ? <div className="pt-1">{action}</div> : null}
+      {action !== undefined ? (
+        <div className="pt-1">
+          <button
+            type="button"
+            onClick={action.onClick}
+            className="text-sm font-medium text-cobalt underline decoration-cobalt/40 underline-offset-4 hover:decoration-cobalt"
+          >
+            {action.label}
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -308,8 +320,8 @@ export function HedgeWorkbench() {
   const position = ladder !== null && spotQuote !== null ? spotPosition(ladder, spotQuote.price) : null;
 
   const fillsNewestFirst = useMemo(() => [...fills].reverse(), [fills]);
-  const verifiedSignatures = useMemo(
-    () => matchVerifiedSignatures(fills, receiptsState.receipts),
+  const receiptMatches = useMemo(
+    () => matchReceipts(fills, receiptsState.receipts),
     [fills, receiptsState.receipts],
   );
 
@@ -327,6 +339,17 @@ export function HedgeWorkbench() {
 
   // Messages above the results: data provenance and the states the ladder can be in.
   const notices: NoticeItem[] = [];
+  if (laddersState.liveError !== null) {
+    notices.push({
+      id: "live-failed",
+      tone: "warning",
+      title: "Live Gemini data could not be loaded",
+      body: `Gemini's ${asset} ladder list could not be read (${laddersState.liveError}), so only captured snapshots are listed. The list is retried every minute, and the page switches to a live ladder by itself when one comes back, unless you have picked a ladder.`,
+      action: { label: "Retry now", onClick: laddersState.retry },
+    });
+  }
+  // True when the selected ticker is live but a snapshot of it is shown because live data failed.
+  const snapshotStandsIn = isSnapshot && selectedTicker !== null && !isSnapshotTicker(selectedTicker);
   if (ladder !== null && isSnapshot) {
     const captured = ladderState.snapshot?.capturedAt ?? ladder.fetchedAt;
     const estimated = ladderState.snapshot?.spotIsEstimated === true;
@@ -340,8 +363,9 @@ export function HedgeWorkbench() {
           : "The spot price is the one observed at capture."
       } Order sizes were not captured, so depth is assumed.`,
     });
-    const liveExists = laddersState.ladders.some((summary) => summary.source === "live");
-    if (userTicker === null && liveExists && !laddersState.choosingDefault) {
+    // Only when the default was chosen by ranking live data and no live ladder qualified.
+    const defaultIsSnapshot = selectedTicker !== null && isSnapshotTicker(selectedTicker);
+    if (userTicker === null && defaultIsSnapshot && laddersState.rankedLive && !laddersState.choosingDefault) {
       notices.push({
         id: "no-live-default",
         tone: "info",
@@ -378,8 +402,10 @@ export function HedgeWorkbench() {
     notices.push({
       id: "refresh-failed",
       tone: "warning",
-      title: "The ladder could not be refreshed",
-      body: `${asSentence(ladderState.error)} Showing the quotes read at ${formatClockTime(ladder.fetchedAt)}.`,
+      title: snapshotStandsIn ? "Live quotes could not be loaded" : "The ladder could not be refreshed",
+      body: snapshotStandsIn
+        ? `${asSentence(ladderState.error)} Showing the snapshot of this ladder captured at ${formatLocalDateTime(ladderState.snapshot?.capturedAt ?? ladder.fetchedAt)}.`
+        : `${asSentence(ladderState.error)} Showing the quotes read at ${formatClockTime(ladder.fetchedAt)}.`,
     });
   }
   if (!isSnapshot && spotQuote !== null && spotState.error !== null) {
@@ -671,6 +697,8 @@ export function HedgeWorkbench() {
             depthNote={depthNote}
             emptyMessage={quantityPrompt}
             cashLimit={cashLimit}
+            bestReachableWorstCase={hedge.bestReachableWorstCase}
+            maxOutlay={planRequest?.maxOutlay ?? null}
             chartSlot={
               planError === null && !noLadderAvailable ? (
                 <PayoffChart
@@ -788,7 +816,8 @@ export function HedgeWorkbench() {
             walletConnected={wallet.publicKey !== null}
             fills={fillsNewestFirst}
             receipts={receiptsState.receipts}
-            verifiedSignatures={verifiedSignatures}
+            verifiedSignatures={receiptMatches.verified}
+            unrecordedSignatures={receiptMatches.unrecorded}
             explorerTxUrl={explorerTxUrl}
             receiptsLoading={receiptsState.loading}
             receiptsError={

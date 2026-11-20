@@ -4,6 +4,7 @@ import {
   describeClientError,
   fetchLadder,
   isOwnAbort,
+  isSnapshotTicker,
   type LadderResponse,
   type SnapshotMeta,
 } from "@/lib/client/api";
@@ -29,8 +30,25 @@ export interface LadderState {
 /** One stored read of a ticker. */
 interface LadderResult {
   ticker: string;
+  /** The last reply that was what was asked for: live data for a live ticker, or the snapshot for a snapshot ticker. */
   data: LadderResponse | null;
+  /**
+   * A snapshot the server sent in place of a live ticker. It is shown only while no live
+   * data exists for the ticker, and never replaces live data already shown.
+   */
+  standIn: LadderResponse | null;
   error: string | null;
+}
+
+/**
+ * Builds the message for a live ticker answered with a snapshot.
+ *
+ * @param {LadderResponse} response - The snapshot reply.
+ * @returns {string} A readable message.
+ */
+function standInMessage(response: LadderResponse): string {
+  const reason = response.liveError ?? "the server sent captured snapshot data instead";
+  return `Live quotes could not be read (${reason}). Live quotes are retried every ${LIVE_LADDER_REFRESH_MS / 1000} seconds`;
 }
 
 /**
@@ -38,8 +56,13 @@ interface LadderResult {
  * the tab is visible, and as soon as the tab becomes visible again if the data is older
  * than that. Snapshot ladders are read once.
  *
+ * A reply that carries a snapshot for a live ticker counts as a failed refresh: the last
+ * live ladder stays on screen with the error set, and polling continues. Only when no live
+ * data was ever read for the ticker is the snapshot shown (it is labelled as one), still
+ * with the error set and polling for live data.
+ *
  * @param {string | null} ticker - Ticker to load, or null when none is selected.
- * @param {LadderResponse | null} preloaded - A response already loaded for this ticker, shown until the first read lands.
+ * @param {LadderResponse | null} preloaded - A live response already loaded for this ticker, shown until the first read lands.
  * @returns {LadderState} The ladder, its provenance, and loading and error states.
  */
 export function useLadder(ticker: string | null, preloaded: LadderResponse | null): LadderState {
@@ -54,24 +77,38 @@ export function useLadder(ticker: string | null, preloaded: LadderResponse | nul
     const controller = new AbortController();
 
     /**
-     * Reads the ladder and stores the outcome; a failure keeps the last good ladder for this ticker.
+     * Reads the ladder and stores the outcome; a failure, or a snapshot sent for a live
+     * ticker, keeps the last good ladder for this ticker.
      *
      * @returns {Promise<void>} Resolves when the outcome is stored.
      */
     const load = async (): Promise<void> => {
       try {
-        const data = await fetchLadder(ticker, controller.signal);
-        setResult({ ticker, data, error: null });
+        const response = await fetchLadder(ticker, controller.signal);
+        if (!isSnapshotTicker(ticker) && response.ladder.source !== "live") {
+          const message = standInMessage(response);
+          console.warn(`[use-ladder] ${ticker}: ${message}`);
+          setResult((previous) => {
+            const same = previous !== null && previous.ticker === ticker;
+            return { ticker, data: same ? previous.data : null, standIn: response, error: message };
+          });
+          return;
+        }
+        setResult({ ticker, data: response, standIn: null, error: null });
       } catch (error) {
         if (isOwnAbort(error, controller.signal)) {
           return;
         }
         const message = describeClientError(error);
-        setResult((previous) => ({
-          ticker,
-          data: previous !== null && previous.ticker === ticker ? previous.data : null,
-          error: message,
-        }));
+        setResult((previous) => {
+          const same = previous !== null && previous.ticker === ticker;
+          return {
+            ticker,
+            data: same ? previous.data : null,
+            standIn: same ? previous.standIn : null,
+            error: message,
+          };
+        });
       }
     };
 
@@ -81,12 +118,13 @@ export function useLadder(ticker: string | null, preloaded: LadderResponse | nul
 
   const current = result !== null && result.ticker === ticker ? result : null;
   const fallback = preloaded !== null && ticker !== null ? preloaded : null;
-  const data = current?.data ?? fallback;
-  const isLive = data !== null && data.ladder.source === "live";
+  const data = current?.data ?? fallback ?? current?.standIn ?? null;
+  // A live ticker keeps polling even while a snapshot stands in, so live data returns on its own.
+  const wantsLive = ticker !== null && !isSnapshotTicker(ticker);
   const fetchedAt = data?.ladder.fetchedAt ?? null;
 
   useEffect(() => {
-    if (!isLive || !visible) {
+    if (!wantsLive || !visible) {
       return;
     }
     const fetchedMs = fetchedAt === null ? Number.NaN : Date.parse(fetchedAt);
@@ -104,8 +142,13 @@ export function useLadder(ticker: string | null, preloaded: LadderResponse | nul
         clearInterval(interval);
       }
     };
-  }, [isLive, visible, fetchedAt]);
+  }, [wantsLive, visible, fetchedAt]);
 
+  /**
+   * Reads the ladder again now.
+   *
+   * @returns {void}
+   */
   const refresh = useCallback((): void => {
     setRequestCount((count) => count + 1);
   }, []);

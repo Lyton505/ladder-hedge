@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HedgePlan, PaperFill } from "@/lib/hedge/types";
 import { PAPER_FILLS_STORAGE_KEY, usePaperFills } from "./use-paper-fills";
 
@@ -38,15 +38,42 @@ function makeFill(id: string): PaperFill {
 describe("usePaperFills", () => {
   beforeEach(() => {
     window.localStorage.clear();
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
   });
 
   afterEach(() => {
     window.localStorage.clear();
+    vi.restoreAllMocks();
   });
 
   it("starts empty", () => {
     const { result } = renderHook(() => usePaperFills());
     expect(result.current.fills).toEqual([]);
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it("warns, naming the storage key, when stored JSON is corrupt", () => {
+    window.localStorage.setItem(PAPER_FILLS_STORAGE_KEY, "{still not json");
+    const { result } = renderHook(() => usePaperFills());
+    expect(result.current.fills).toEqual([]);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(PAPER_FILLS_STORAGE_KEY));
+  });
+
+  it("drops malformed entries with a warning and keeps the valid ones", () => {
+    const planWithoutLegs: Record<string, unknown> = { ...PLAN };
+    delete planWithoutLegs.legs;
+    const entries = [
+      makeFill("fill-ok"),
+      { ...makeFill("no-legs"), plan: planWithoutLegs },
+      { ...makeFill("bad-leg"), plan: { ...PLAN, legs: [{ quantity: "lots" }] } },
+      { ...makeFill("bad-cost"), plan: { ...PLAN, totalCost: "free" } },
+      { ...makeFill("bad-exposure"), exposure: { asset: "SOL" } },
+    ];
+    window.localStorage.setItem(PAPER_FILLS_STORAGE_KEY, JSON.stringify(entries));
+    const { result } = renderHook(() => usePaperFills());
+    expect(result.current.fills.map((fill) => fill.id)).toEqual(["fill-ok"]);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("dropped 4 malformed entries"));
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(PAPER_FILLS_STORAGE_KEY));
   });
 
   it("persists an added fill across a remount", () => {

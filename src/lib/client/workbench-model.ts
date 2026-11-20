@@ -7,6 +7,7 @@ import type {
   LadderSummary,
   PaperFill,
 } from "@/lib/hedge/types";
+import { BEST_EFFORT_LIFT_SLACK_FRACTION, BEST_EFFORT_SLACK_FRACTION } from "@/lib/hedge";
 import { MEMO_HASH_PREFIX_LENGTH, parseReceiptMemo } from "@/lib/solana/receipt-memo";
 import { formatStrike, formatUsd } from "@/components/format";
 
@@ -84,7 +85,9 @@ export function horizonLabel(horizon: LadderHorizon): string {
  * (ties go to the later expiry), provided it has at least {@link MIN_TWO_SIDED_RUNGS}.
  * Hourly ladders are often quoted on one side only, so the soonest expiry is not used.
  * When no live ladder qualifies, the first snapshot that has not expired is used, then
- * any snapshot, then the first ladder listed.
+ * any snapshot, then the first ladder listed. The server lists snapshots in preference
+ * order (unexpired first, by most two-sided rungs, then later expiry), so the first
+ * unexpired snapshot is the asset's default snapshot.
  *
  * @param {LadderSummary[]} ladders - Summaries in the server's order (live first, snapshots in preference order).
  * @param {ReadonlyMap<string, number>} twoSidedByTicker - Two-sided rung counts for the live ladders that could be loaded.
@@ -335,6 +338,64 @@ export function cashLimitNote(
   };
 }
 
+/** Inputs to {@link bestEffortExplanation}. */
+export interface BestEffortInput {
+  /** The floor as a non-positive dollar amount (minus the plan's requested maximum loss). */
+  floor: number;
+  /** Worst case without a hedge, in dollars. */
+  worstCaseBefore: number;
+  /** Worst case with this basket, in dollars. */
+  worstCaseAfter: number;
+  /**
+   * Best worst case any basket could reach within the current limits, before rounding
+   * (`bestAchievableWorstCase` on the same request, cash limit included); null when unknown.
+   */
+  bestReachable: number | null;
+  /** Position value in dollars (quantity times spot). */
+  positionValue: number;
+  /** Cash limit in dollars, or null when none is set. */
+  cashLimit: number | null;
+}
+
+/** Half a cent: figures closer than this read the same once formatted to the cent. */
+const HALF_CENT = 0.005;
+
+/**
+ * Explains a `best-effort` plan in plain words: the best worst case any basket could reach
+ * within the current limits, the worst case this basket reaches, and why it stops short
+ * (the engine deliberately gives up as much as the smaller of 0.1% of position value and 5%
+ * of the improvement over no hedge, because the last part of the protection costs
+ * disproportionately more). It never says the basket is the best possible.
+ *
+ * @param {BestEffortInput} input - The plan's figures and the best reachable worst case.
+ * @returns {string} Two to four sentences.
+ */
+export function bestEffortExplanation(input: BestEffortInput): string {
+  const { floor, worstCaseBefore, worstCaseAfter, positionValue, cashLimit } = input;
+  const best = input.bestReachable !== null && Number.isFinite(input.bestReachable) ? input.bestReachable : null;
+  const within = cashLimit === null ? "" : ` within your cash limit of ${formatUsd(cashLimit)}`;
+  const reaches = `This basket reaches ${formatUsd(worstCaseAfter)}`;
+  const why = "the last part of the protection costs disproportionately more";
+  const rule = "the smaller of 0.1% of the position's value and 5% of the improvement over no hedge";
+  const inversion =
+    "For the same reason, a slightly looser floor that can be met may show a better worst case than this basket.";
+
+  if (best === null) {
+    return `${reaches}. It stops short of the best reachable worst case on purpose: ${why}, so the engine gives up as much as ${rule}. ${inversion}`;
+  }
+  const gap = Math.max(0, best - worstCaseAfter);
+  const giveUp = `the engine can also give up as much as ${rule} on purpose, because ${why}`;
+  if (best >= floor - HALF_CENT) {
+    return `Before rounding, a basket${within} could reach ${formatUsd(best)}, which meets your floor; with sizes rounded to tradable steps and each leg's fee rounded up to the cent, none was found that does. ${reaches}, ${formatUsd(gap)} short of ${formatUsd(best)}: rounding causes part of the gap, and ${giveUp}. ${inversion}`;
+  }
+  const reach = `The best worst case any basket of these quotes could reach${within} is ${formatUsd(best)}.`;
+  const slack = Math.min(BEST_EFFORT_SLACK_FRACTION * positionValue, BEST_EFFORT_LIFT_SLACK_FRACTION * (best - worstCaseBefore));
+  if (gap <= slack + HALF_CENT) {
+    return `${reach} ${reaches}, ${formatUsd(gap)} short of that on purpose: ${why}, so it gives up at most ${rule} (here ${formatUsd(slack)}). ${inversion}`;
+  }
+  return `${reach} ${reaches}, ${formatUsd(gap)} short of that. Rounding to tradable sizes and cent fees can cause part of the gap, and ${giveUp}. ${inversion}`;
+}
+
 /** The three cost figures under the headline, rounded to the cent as displayed. */
 export interface CostFigures {
   /** Paid up front, rounded to the cent. */
@@ -443,32 +504,52 @@ export function spotPositionNotice(input: SpotNoticeInput): SpotNoticeCopy | nul
   return null;
 }
 
+/** How the on-chain receipts compare with the paper fills saved in this browser. */
+export interface ReceiptMatches {
+  /**
+   * Signatures of receipts this browser recorded: a saved fill stores the same signature,
+   * and the memo's event ticker and plan-hash prefix match that fill.
+   */
+  verified: string[];
+  /**
+   * Signatures of receipts whose memo matches a saved fill's event ticker and plan-hash
+   * prefix, but which no saved fill recorded. Anyone can copy a public memo into a
+   * transaction that mentions the wallet, so these are not verified.
+   */
+  unrecorded: string[];
+}
+
 /**
- * Finds the on-chain receipts whose memo matches a paper fill saved in this browser:
- * same event ticker and the same plan-hash prefix.
+ * Compares on-chain receipts with the paper fills saved in this browser. A receipt is
+ * verified only when a saved fill recorded that very transaction (`fill.signature` equals
+ * the receipt's signature) and the memo's event ticker and plan-hash prefix match that fill.
+ * A memo that matches a saved plan under another signature is reported as unrecorded.
  *
  * @param {readonly PaperFill[]} fills - Fills saved locally.
  * @param {readonly HedgeReceipt[]} receipts - Receipts read from chain.
- * @returns {string[]} Signatures of the matching receipts.
+ * @returns {ReceiptMatches} Verified and unrecorded-but-matching signatures.
  */
-export function matchVerifiedSignatures(
-  fills: readonly PaperFill[],
-  receipts: readonly HedgeReceipt[],
-): string[] {
+export function matchReceipts(fills: readonly PaperFill[], receipts: readonly HedgeReceipt[]): ReceiptMatches {
   const verified: string[] = [];
+  const unrecorded: string[] = [];
   for (const receipt of receipts) {
     const parsed = parseReceiptMemo(receipt.memo);
     if (parsed === null) {
       continue;
     }
-    const matches = fills.some(
-      (fill) =>
-        fill.eventTicker === parsed.eventTicker &&
-        fill.planHash.slice(0, MEMO_HASH_PREFIX_LENGTH) === parsed.planHash,
-    );
-    if (matches) {
+    /**
+     * Says whether the receipt's memo names this fill's ladder and plan-hash prefix.
+     *
+     * @param {PaperFill} fill - A saved fill.
+     * @returns {boolean} True when ticker and hash prefix match.
+     */
+    const memoMatches = (fill: PaperFill): boolean =>
+      fill.eventTicker === parsed.eventTicker && fill.planHash.slice(0, MEMO_HASH_PREFIX_LENGTH) === parsed.planHash;
+    if (fills.some((fill) => fill.signature === receipt.signature && memoMatches(fill))) {
       verified.push(receipt.signature);
+    } else if (fills.some(memoMatches)) {
+      unrecorded.push(receipt.signature);
     }
   }
-  return verified;
+  return { verified, unrecorded };
 }

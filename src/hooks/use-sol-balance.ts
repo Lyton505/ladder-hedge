@@ -71,6 +71,11 @@ export function useSolBalance(): SolBalanceState {
     };
   }, [connection, publicKey, ownerKey, requestKey]);
 
+  /**
+   * Reads the wallet's SOL balance again.
+   *
+   * @returns {void}
+   */
   const refresh = useCallback((): void => {
     setRefreshCount((count) => count + 1);
   }, []);

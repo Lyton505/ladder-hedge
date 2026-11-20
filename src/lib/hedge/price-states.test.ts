@@ -21,6 +21,18 @@ describe("resolveStressPrice", () => {
     expect(resolveStressPrice(SOL_FIXTURE_LADDER, { ...SOL_FIXTURE_EXPOSURE, spot: 1 }, null)).toBe(0);
     expect(resolveStressPrice(SOL_FIXTURE_LADDER, { ...SOL_FIXTURE_EXPOSURE, spot: 1.5 }, null)).toBe(0.5);
   });
+
+  it("never goes below zero when the lowest strike is below the median gap", () => {
+    const ladder = {
+      ...SOL_FIXTURE_LADDER,
+      rungs: [makeFixtureRung(1, 0.9, 0.95), makeFixtureRung(5, 0.5, 0.6), makeFixtureRung(9, 0.1, 0.2)],
+    };
+    // The ladder default alone is 1 - 4 = -3; spot 6 gives a spot term of 2.
+    expect(defaultStressPrice(ladder)).toBe(-3);
+    const stress = resolveStressPrice(ladder, { ...SOL_FIXTURE_EXPOSURE, spot: 6 }, null);
+    expect(stress).toBe(0);
+    expect(buildPriceStates(ladder, stress)[0].evalPrice).toBe(0);
+  });
 });
 
 describe("defaultStressPrice", () => {

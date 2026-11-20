@@ -1,5 +1,6 @@
 import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import {
+  bestAchievableWorstCase,
   buildPriceStates,
   checkCoherence,
   maxHedgeableQuantity,
@@ -72,6 +73,12 @@ export interface HedgePlanState {
   unlimitedPlan: HedgePlan | null;
   /** Readable message when the plan without a limit could not be computed. */
   unlimitedPlanError: string | null;
+  /**
+   * The best worst case any basket could reach for the same request, cash limit included,
+   * before rounding (`bestAchievableWorstCase`). Computed only for a `best-effort` plan, so
+   * the page can show how far short the plan stops; null otherwise, or when it failed.
+   */
+  bestReachableWorstCase: number | null;
 }
 
 /** Engine outputs for one request. */
@@ -157,6 +164,23 @@ function computeUnlimited(request: HedgeRequest): UnlimitedResult {
 }
 
 /**
+ * Computes the best worst case any basket could reach for a request, cash limit included.
+ *
+ * @param {HedgeRequest} request - The request the plan was computed from.
+ * @returns {number | null} t* in dollars, or null when it is not finite or the engine failed (the error is logged).
+ */
+function computeBestReachable(request: HedgeRequest): number | null {
+  try {
+    const best = bestAchievableWorstCase(request);
+    return Number.isFinite(best) ? best : null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[use-hedge-plan] best reachable worst case failed: ${message}`);
+    return null;
+  }
+}
+
+/**
  * Computes the hedge plan, payoff curve, price states and quote-consistency findings
  * for the current inputs, and the largest quantity the quotes can hedge to the same floor.
  *
@@ -165,14 +189,16 @@ function computeUnlimited(request: HedgeRequest): UnlimitedResult {
  * the inputs have been still for {@link MAX_HEDGEABLE_DEBOUNCE_MS}. When a cash limit is
  * set and the plan falls short of the floor, the plan without the limit is also computed
  * once per deferred request (memoised), so the page can say which of the two stands in
- * the way.
+ * the way. For a `best-effort` plan, the best worst case reachable within the same limits
+ * is also computed once per deferred request (memoised), for the status copy.
  *
  * @param {HedgePlanInputs | null} inputs - The inputs, or null while the ladder or spot is missing. Inputs
  *   with a quantity or spot that is zero, negative or not finite are treated like null.
  * @returns {HedgePlanState} The plan and derived data. Engine errors never escape: plan, payoff
  *   and price-state errors are caught into `error`, coherence errors into `coherenceError`,
  *   largest-hedgeable errors into `maxHedgeableStatus: "error"`, and errors in the plan without
- *   a limit into `unlimitedPlanError`.
+ *   a limit into `unlimitedPlanError`, and errors in the best reachable worst case are logged
+ *   and leave `bestReachableWorstCase` null.
  */
 export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
   const ladder = inputs?.ladder ?? null;
@@ -222,6 +248,11 @@ export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
     }
     return computeUnlimited(deferredRequest);
   }, [deferredRequest, limitedStatus]);
+
+  const bestReachableWorstCase = useMemo<number | null>(
+    () => (deferredRequest === null || limitedStatus !== "best-effort" ? null : computeBestReachable(deferredRequest)),
+    [deferredRequest, limitedStatus],
+  );
 
   const coherenceResult = useMemo<CoherenceResult>(() => {
     if (ladder === null) {
@@ -285,5 +316,6 @@ export function useHedgePlan(inputs: HedgePlanInputs | null): HedgePlanState {
     maxHedgeableStatus,
     unlimitedPlan: unlimitedResult.plan,
     unlimitedPlanError: unlimitedResult.error,
+    bestReachableWorstCase,
   };
 }

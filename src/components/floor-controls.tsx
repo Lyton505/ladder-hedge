@@ -355,7 +355,7 @@ export function FloorControls({
         <p id={outlayHelpId} className="text-xs leading-relaxed text-graphite">
           {noOutlayLimit
             ? "The plan may ask for any amount up front to reach the floor."
-            : "The plan never pays more than this. If the floor needs more, you get the best protection within it, and the page says how much the floor would take."}
+            : "The plan never pays more than this. If the floor needs more, the page says so, shows how close a basket within the limit gets, and says how much the floor would take."}
         </p>
       </div>
 

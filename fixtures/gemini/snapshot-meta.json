@@ -1,6 +1,30 @@
 {
-  "description": "Captured Gemini prediction-market ladder events. Entries are listed in preference order: the first entry for an asset is its default snapshot. referenceSpot is the asset's spot at capture time; when spotIsEstimated is true it was not observed but estimated as the strike where the mid-implied survival crosses 0.5 (linear interpolation between adjacent two-sided rungs).",
+  "description": "Captured Gemini prediction-market ladder events. The default snapshot for an asset is chosen by the ladder service: among snapshots that have not expired, the one with the most two-sided rungs, then the later expiry; when all have expired, the first listed here. referenceSpot is the asset's spot at capture time; when spotIsEstimated is true it was not observed but estimated as the strike where the mid-implied survival crosses 0.5 (linear interpolation between adjacent two-sided rungs).",
   "snapshots": [
+    {
+      "ticker": "SOL2611302200",
+      "file": "sol-2611302200.json",
+      "capturedAt": "2026-11-20T07:09:25Z",
+      "referenceSpot": 72.657,
+      "spotIsEstimated": false,
+      "spotSource": "Gemini SOLUSD pubticker bid/ask mid at capture (bid 72.64600, ask 72.66800)"
+    },
+    {
+      "ticker": "BTC2611302200",
+      "file": "btc-2611302200.json",
+      "capturedAt": "2026-11-20T07:09:27Z",
+      "referenceSpot": 61889.495,
+      "spotIsEstimated": false,
+      "spotSource": "Gemini BTCUSD pubticker bid/ask mid at capture (bid 61889.49000, ask 61889.50000)"
+    },
+    {
+      "ticker": "ETH2611302200",
+      "file": "eth-2611302200.json",
+      "capturedAt": "2026-11-20T07:09:27Z",
+      "referenceSpot": 1745.335,
+      "spotIsEstimated": false,
+      "spotSource": "Gemini ETHUSD pubticker bid/ask mid at capture (bid 1745.33000, ask 1745.34000)"
+    },
     {
       "ticker": "SOL2611202200",
       "file": "sol-2611202200.json",

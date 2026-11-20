@@ -17,6 +17,9 @@ import eth2611200500 from "../../../fixtures/gemini/eth-2611200500.json";
 import eth2611202200 from "../../../fixtures/gemini/eth-2611202200.json";
 import sol2611200500 from "../../../fixtures/gemini/sol-2611200500.json";
 import sol2611202200 from "../../../fixtures/gemini/sol-2611202200.json";
+import btc2611302200 from "../../../fixtures/gemini/btc-2611302200.json";
+import eth2611302200 from "../../../fixtures/gemini/eth-2611302200.json";
+import sol2611302200 from "../../../fixtures/gemini/sol-2611302200.json";
 
 /** Suffix that marks a snapshot ticker so it never collides with a live ticker. */
 export const SNAPSHOT_SUFFIX = "-SNAPSHOT";
@@ -24,8 +27,17 @@ export const SNAPSHOT_SUFFIX = "-SNAPSHOT";
 /** How long a live ladder request waits for order-book sizes before leaving them null. */
 export const ORDER_BOOK_TIMEOUT_MS = 2500;
 
+/**
+ * How long a fetched crypto events list is reused before Gemini is asked again. Ladders
+ * built from a cached list keep the time the list was actually fetched as `fetchedAt`.
+ */
+export const EVENTS_CACHE_TTL_MS = 20_000;
+
 /** Captured event files, keyed by the file name used in `snapshot-meta.json`. */
 const SNAPSHOT_FILES: Readonly<Record<string, unknown>> = {
+  "sol-2611302200.json": sol2611302200,
+  "btc-2611302200.json": btc2611302200,
+  "eth-2611302200.json": eth2611302200,
   "sol-2611202200.json": sol2611202200,
   "btc-2611202200.json": btc2611202200,
   "eth-2611202200.json": eth2611202200,
@@ -51,6 +63,38 @@ interface SnapshotEntry {
   info: SnapshotInfo;
   ladder: Ladder;
 }
+
+/** Ladders listed for an asset, and whether the live part of the list failed. */
+export interface LadderList {
+  /** Live ladders (when the live call worked) followed by snapshots. */
+  ladders: LadderSummary[];
+  /**
+   * Short reason the live Gemini list could not be read, so only snapshots are listed;
+   * null when the live call worked (even if it found no live ladder) or live data is disabled.
+   */
+  liveError: string | null;
+}
+
+/** One ladder, and why a snapshot stands in for it when a live ticker was asked for. */
+export interface LadderLoad {
+  ladder: Ladder;
+  /**
+   * Short reason live data could not be served when a live ticker was requested and a
+   * snapshot of it is returned instead; null when the ladder is what was asked for.
+   */
+  liveError: string | null;
+}
+
+/** A crypto events list read from Gemini, with the time it was read. */
+interface FetchedEvents {
+  events: unknown[];
+  /** ISO time the list was fetched from Gemini. */
+  fetchedAt: string;
+  fetchedMs: number;
+}
+
+/** Last events list read from Gemini, reused for EVENTS_CACHE_TTL_MS; failures are never cached. */
+let eventsCache: FetchedEvents | null = null;
 
 /** The requested ladder does not exist, is not a crypto ladder, or is no longer tradable. */
 export class LadderNotFoundError extends Error {
@@ -152,6 +196,37 @@ function loadSnapshots(): SnapshotEntry[] {
 }
 
 /**
+ * Counts the rungs quoted on both sides (a YES bid and a YES ask).
+ *
+ * @param {Ladder} ladder - The ladder.
+ * @returns {number} Number of two-sided rungs.
+ */
+function twoSidedRungs(ladder: Ladder): number {
+  return ladder.rungs.filter((rung) => rung.yesBid !== null && rung.yesAsk !== null).length;
+}
+
+/**
+ * Lists the snapshots of an asset in preference order: those that have not expired first,
+ * by most two-sided rungs and then later expiry, followed by expired ones in the order of
+ * `snapshot-meta.json`. The first entry for an asset is its default snapshot.
+ *
+ * @param {string | null} asset - Upper-case asset code, or null for all assets.
+ * @param {number} nowMs - Current time in epoch milliseconds.
+ * @returns {SnapshotEntry[]} Snapshot entries in preference order.
+ * @throws {Error} When the bundled fixtures are malformed.
+ */
+function orderedSnapshots(asset: string | null, nowMs: number): SnapshotEntry[] {
+  const entries = loadSnapshots().filter((entry) => asset === null || entry.ladder.asset === asset);
+  const unexpired = entries.filter((entry) => Date.parse(entry.ladder.expiry) > nowMs);
+  const expired = entries.filter((entry) => !(Date.parse(entry.ladder.expiry) > nowMs));
+  unexpired.sort(
+    (a, b) =>
+      twoSidedRungs(b.ladder) - twoSidedRungs(a.ladder) || Date.parse(b.ladder.expiry) - Date.parse(a.ladder.expiry),
+  );
+  return [...unexpired, ...expired];
+}
+
+/**
  * Returns a deep copy of a ladder so callers cannot mutate the cached snapshots.
  *
  * @param {Ladder} ladder - The ladder to copy.
@@ -165,12 +240,45 @@ function cloneLadder(ladder: Ladder): Ladder {
  * Lists snapshot ladders, optionally for one asset.
  *
  * @param {string | null} asset - Upper-case asset code, or null for all.
- * @returns {Ladder[]} Snapshot ladders in preference order.
+ * @returns {Ladder[]} Snapshot ladders in preference order (see `orderedSnapshots`).
  */
 function snapshotLadders(asset: string | null): Ladder[] {
-  return loadSnapshots()
-    .filter((entry) => asset === null || entry.ladder.asset === asset)
-    .map((entry) => cloneLadder(entry.ladder));
+  return orderedSnapshots(asset, Date.now()).map((entry) => cloneLadder(entry.ladder));
+}
+
+/**
+ * Forgets the cached crypto events list, so the next list call asks Gemini. Used by tests.
+ *
+ * @returns {void}
+ */
+export function clearEventsCache(): void {
+  eventsCache = null;
+}
+
+/**
+ * Reads Gemini's active crypto events, reusing a list fetched less than
+ * EVENTS_CACHE_TTL_MS ago. A failed read is retried once; failures are not cached.
+ *
+ * @returns {Promise<FetchedEvents>} The events and the time they were fetched.
+ * @throws {GeminiError} When both attempts fail.
+ */
+async function loadCryptoEvents(): Promise<FetchedEvents> {
+  const cached = eventsCache;
+  if (cached !== null && Date.now() - cached.fetchedMs < EVENTS_CACHE_TTL_MS) {
+    return cached;
+  }
+  let events: unknown[];
+  try {
+    events = await fetchActiveCryptoEvents();
+  } catch (firstError) {
+    console.warn(`[ladder-service] live ladder list failed, retrying once: ${describeError(firstError)}`);
+    // A second failure propagates to the caller, which serves snapshots and reports it.
+    events = await fetchActiveCryptoEvents();
+  }
+  const fetchedMs = Date.now();
+  const fetched: FetchedEvents = { events, fetchedAt: new Date(fetchedMs).toISOString(), fetchedMs };
+  eventsCache = fetched;
+  return fetched;
 }
 
 /**
@@ -201,34 +309,35 @@ export function getSnapshotInfo(eventTicker: string): SnapshotInfo | null {
 
 /**
  * Lists ladders: live ladders that have not expired (sorted by asset, then expiry), followed
- * by snapshot ladders. When the live call fails or `LADDER_FORCE_SNAPSHOT=1`, only snapshots
- * are returned.
+ * by snapshot ladders. When the live call fails (after one retry) or `LADDER_FORCE_SNAPSHOT=1`,
+ * only snapshots are returned; a failure is reported in `liveError`. The live events list is
+ * reused for EVENTS_CACHE_TTL_MS.
  *
  * @param {string | null} asset - Asset code to filter by (any case), or null for all assets.
- * @returns {Promise<LadderSummary[]>} Ladder summaries, live first.
+ * @returns {Promise<LadderList>} Ladder summaries, live first, and the live failure if any.
  * @throws {GeminiError} kind "invalid-input" for a malformed asset.
  * @throws {LadderUnavailableError} When Gemini fails and no snapshot exists for the asset.
  */
-export async function listLadders(asset: string | null): Promise<LadderSummary[]> {
+export async function listLadders(asset: string | null): Promise<LadderList> {
   try {
     const assetCode = asset === null ? null : normalizeAsset(asset);
     const snapshots = snapshotLadders(assetCode).map((ladder) => summarizeLadder(ladder));
     if (isForceSnapshot()) {
-      return snapshots;
+      return { ladders: snapshots, liveError: null };
     }
 
-    let events: unknown[];
+    let fetched: FetchedEvents;
     try {
-      events = await fetchActiveCryptoEvents();
+      fetched = await loadCryptoEvents();
     } catch (error) {
       if (snapshots.length > 0) {
         console.warn(`[ladder-service] live ladder list failed, serving snapshots: ${describeError(error)}`);
-        return snapshots;
+        return { ladders: snapshots, liveError: describeError(error) };
       }
       throw new LadderUnavailableError(`Gemini ladder list is unavailable: ${describeError(error)}`, error);
     }
 
-    const fetchedAt = new Date().toISOString();
+    const { events, fetchedAt } = fetched;
     const now = Date.now();
     const live: Ladder[] = [];
     for (const event of events) {
@@ -242,7 +351,7 @@ export async function listLadders(asset: string | null): Promise<LadderSummary[]
       live.push(ladder);
     }
     live.sort((a, b) => a.asset.localeCompare(b.asset) || Date.parse(a.expiry) - Date.parse(b.expiry));
-    return [...live.map((ladder) => summarizeLadder(ladder)), ...snapshots];
+    return { ladders: [...live.map((ladder) => summarizeLadder(ladder)), ...snapshots], liveError: null };
   } catch (error) {
     if (error instanceof GeminiError || error instanceof LadderUnavailableError) {
       throw error;
@@ -279,14 +388,14 @@ function applySizes(rungs: LadderRung[], books: Map<string, TopOfBook>): LadderR
  * Loads one ladder. Tickers ending in `-SNAPSHOT` are served from fixtures. Live tickers are
  * fetched from Gemini with best-effort order-book sizes; if the live event fails, is settled
  * or is no longer a ladder, a snapshot captured from the same ticker is served instead when
- * one exists.
+ * one exists, with the reason in `liveError` so callers can tell it from live data.
  *
  * @param {string} ticker - Live ticker such as "SOL2611202200" or snapshot ticker such as "SOL2611202200-SNAPSHOT".
- * @returns {Promise<Ladder>} The ladder.
+ * @returns {Promise<LadderLoad>} The ladder, and why a snapshot stands in for a live ticker.
  * @throws {LadderNotFoundError} When no such ladder exists (or the ticker is malformed) and no snapshot stands in.
  * @throws {LadderUnavailableError} When Gemini fails and no snapshot stands in.
  */
-export async function getLadder(ticker: string): Promise<Ladder> {
+export async function loadLadder(ticker: string): Promise<LadderLoad> {
   try {
     const upper = ticker.trim().toUpperCase();
     const snapshot = findSnapshot(upper);
@@ -294,7 +403,7 @@ export async function getLadder(ticker: string): Promise<Ladder> {
       if (snapshot === null) {
         throw new LadderNotFoundError(`No snapshot ladder ${upper}`);
       }
-      return cloneLadder(snapshot.ladder);
+      return { ladder: cloneLadder(snapshot.ladder), liveError: null };
     }
 
     let liveTicker: string;
@@ -308,7 +417,7 @@ export async function getLadder(ticker: string): Promise<Ladder> {
       if (snapshot === null) {
         throw new LadderNotFoundError(`Live data is disabled and there is no snapshot of ${liveTicker}`);
       }
-      return cloneLadder(snapshot.ladder);
+      return { ladder: cloneLadder(snapshot.ladder), liveError: "live data is disabled on this server" };
     }
 
     let ladder: Ladder | null = null;
@@ -324,7 +433,7 @@ export async function getLadder(ticker: string): Promise<Ladder> {
       if (snapshot !== null) {
         const reason = liveFailure === null ? "not an active ladder" : describeError(liveFailure);
         console.warn(`[ladder-service] live ladder ${liveTicker} unavailable (${reason}), serving snapshot`);
-        return cloneLadder(snapshot.ladder);
+        return { ladder: cloneLadder(snapshot.ladder), liveError: reason };
       }
       if (liveFailure === null) {
         throw new LadderNotFoundError(`${liveTicker} is not an active crypto price ladder`);
@@ -339,7 +448,27 @@ export async function getLadder(ticker: string): Promise<Ladder> {
       ladder.rungs.map((rung) => rung.instrumentSymbol),
       ORDER_BOOK_TIMEOUT_MS,
     );
-    return { ...ladder, rungs: applySizes(ladder.rungs, books) };
+    return { ladder: { ...ladder, rungs: applySizes(ladder.rungs, books) }, liveError: null };
+  } catch (error) {
+    if (error instanceof LadderNotFoundError || error instanceof LadderUnavailableError) {
+      throw error;
+    }
+    throw new LadderUnavailableError(`Failed to load ladder ${ticker.slice(0, 80)}: ${describeError(error)}`, error);
+  }
+}
+
+/**
+ * Loads one ladder, as {@link loadLadder} does, without the stand-in reason.
+ *
+ * @param {string} ticker - Live or snapshot ticker.
+ * @returns {Promise<Ladder>} The ladder.
+ * @throws {LadderNotFoundError} When no such ladder exists (or the ticker is malformed) and no snapshot stands in.
+ * @throws {LadderUnavailableError} When Gemini fails and no snapshot stands in.
+ */
+export async function getLadder(ticker: string): Promise<Ladder> {
+  try {
+    const { ladder } = await loadLadder(ticker);
+    return ladder;
   } catch (error) {
     if (error instanceof LadderNotFoundError || error instanceof LadderUnavailableError) {
       throw error;
@@ -350,7 +479,8 @@ export async function getLadder(ticker: string): Promise<Ladder> {
 
 /**
  * Returns the spot price for an asset: live from Gemini, or, when `LADDER_FORCE_SNAPSHOT=1`,
- * the reference spot of the asset's default snapshot with its provenance in `source`.
+ * the reference spot of the asset's default snapshot (see `orderedSnapshots`) with its
+ * provenance in `source`.
  *
  * @param {string} asset - Asset code such as "SOL" (any case).
  * @returns {Promise<SpotQuote>} The spot quote.
@@ -363,7 +493,7 @@ export async function getSpotQuote(asset: string): Promise<SpotQuote> {
     if (!isForceSnapshot()) {
       return await fetchSpot(assetCode);
     }
-    const entry = loadSnapshots().find((candidate) => candidate.ladder.asset === assetCode);
+    const entry = orderedSnapshots(assetCode, Date.now()).at(0);
     if (entry === undefined) {
       throw new LadderNotFoundError(`Live data is disabled and there is no snapshot spot for ${assetCode}`);
     }

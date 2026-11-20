@@ -12,6 +12,25 @@ import type { Ladder, LadderSummary, SpotQuote } from "@/lib/hedge/types";
 export const API_TIMEOUT_MS = 15_000;
 
 /**
+ * How long the browser waits for the ladder list. The server gives Gemini's events list
+ * 15 seconds and retries once, so the list can take about 30 seconds before it falls back.
+ */
+export const LADDER_LIST_TIMEOUT_MS = 40_000;
+
+/** Suffix of snapshot tickers; mirrors `SNAPSHOT_SUFFIX` in the server's ladder service. */
+export const SNAPSHOT_TICKER_SUFFIX = "-SNAPSHOT";
+
+/**
+ * Says whether a ticker names a captured snapshot rather than a live ladder.
+ *
+ * @param {string} ticker - An event ticker.
+ * @returns {boolean} True for tickers ending in `-SNAPSHOT` (any case).
+ */
+export function isSnapshotTicker(ticker: string): boolean {
+  return ticker.trim().toUpperCase().endsWith(SNAPSHOT_TICKER_SUFFIX);
+}
+
+/**
  * Provenance of a snapshot ladder, as returned by `/api/ladders/{ticker}`.
  * Mirrors `SnapshotInfo` in the server's ladder service, redeclared here so the
  * client never imports server modules.
@@ -30,6 +49,22 @@ export interface SnapshotMeta {
 export interface LadderResponse {
   ladder: Ladder;
   snapshot: SnapshotMeta | null;
+  /**
+   * Short reason live data could not be served when a live ticker was requested and a
+   * snapshot of it came back instead; null otherwise.
+   */
+  liveError: string | null;
+}
+
+/** Body of a successful `/api/ladders` response. */
+export interface LadderListResponse {
+  /** Live ladders first, then snapshots. */
+  ladders: LadderSummary[];
+  /**
+   * Short reason the live Gemini list could not be read, so only snapshots are listed;
+   * null when live data worked (even with no live ladder) or is disabled on the server.
+   */
+  liveError: string | null;
 }
 
 /** An error from one of the app's routes, with the HTTP status when there was one. */
@@ -140,13 +175,14 @@ function isSpotQuote(value: unknown): value is SpotQuote {
  *
  * @param {string} url - Same-origin route URL.
  * @param {AbortSignal} [signal] - Cancels the request, for example when the component unmounts.
+ * @param {number} [timeoutMs] - How long to wait for the reply. Defaults to API_TIMEOUT_MS.
  * @returns {Promise<unknown>} The parsed JSON body of a 2xx response.
  * @throws {ApiError} With the route's `{ error }` message for 4xx and 5xx responses, or a
  *   readable message for timeouts, network failures and unreadable bodies.
  * @throws {DOMException} An `AbortError` when `signal` aborts, so callers can ignore it.
  */
-export async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
-  const timeout = AbortSignal.timeout(API_TIMEOUT_MS);
+export async function fetchJson(url: string, signal?: AbortSignal, timeoutMs: number = API_TIMEOUT_MS): Promise<unknown> {
+  const timeout = AbortSignal.timeout(timeoutMs);
   const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
   let response: Response;
   try {
@@ -156,7 +192,7 @@ export async function fetchJson(url: string, signal?: AbortSignal): Promise<unkn
       throw error;
     }
     if (timeout.aborted) {
-      throw new ApiError(`The server did not answer within ${API_TIMEOUT_MS / 1000} seconds.`, null, error);
+      throw new ApiError(`The server did not answer within ${timeoutMs / 1000} seconds.`, null, error);
     }
     const detail = error instanceof Error ? error.message : String(error);
     throw new ApiError(`Could not reach the server (${detail}).`, null, error);
@@ -183,20 +219,22 @@ export async function fetchJson(url: string, signal?: AbortSignal): Promise<unkn
 }
 
 /**
- * Lists the ladders for an asset: live ladders first, then captured snapshots.
+ * Lists the ladders for an asset: live ladders first, then captured snapshots, and the
+ * reason live data failed when only snapshots could be listed.
  *
  * @param {string} asset - Asset code, for example "SOL".
  * @param {AbortSignal} [signal] - Cancels the request.
- * @returns {Promise<LadderSummary[]>} Ladder summaries in the server's order.
+ * @returns {Promise<LadderListResponse>} Ladder summaries in the server's order, and the live failure if any.
  * @throws {ApiError} When the route fails or answers with an unexpected shape.
  */
-export async function fetchLadderList(asset: string, signal?: AbortSignal): Promise<LadderSummary[]> {
+export async function fetchLadderList(asset: string, signal?: AbortSignal): Promise<LadderListResponse> {
   try {
-    const body = await fetchJson(`/api/ladders?asset=${encodeURIComponent(asset)}`, signal);
+    const body = await fetchJson(`/api/ladders?asset=${encodeURIComponent(asset)}`, signal, LADDER_LIST_TIMEOUT_MS);
     if (!isRecord(body) || !Array.isArray(body.ladders)) {
       throw new ApiError("The ladder list came back in an unexpected shape.", null);
     }
-    return body.ladders.filter(isLadderSummary);
+    const liveError = typeof body.liveError === "string" && body.liveError !== "" ? body.liveError : null;
+    return { ladders: body.ladders.filter(isLadderSummary), liveError };
   } catch (error) {
     if (error instanceof ApiError || signal?.aborted === true) {
       throw error;
@@ -210,7 +248,8 @@ export async function fetchLadderList(asset: string, signal?: AbortSignal): Prom
  *
  * @param {string} ticker - Live or snapshot event ticker.
  * @param {AbortSignal} [signal] - Cancels the request.
- * @returns {Promise<LadderResponse>} The ladder and, for snapshots, where it came from.
+ * @returns {Promise<LadderResponse>} The ladder, for snapshots where it came from, and why
+ *   live data could not be served when a snapshot stands in for a live ticker.
  * @throws {ApiError} When the route fails (404 for unknown or settled ladders, 502 when Gemini
  *   fails with no snapshot to stand in) or answers with an unexpected shape.
  */
@@ -221,7 +260,8 @@ export async function fetchLadder(ticker: string, signal?: AbortSignal): Promise
       throw new ApiError(`Ladder ${ticker} came back in an unexpected shape.`, null);
     }
     const snapshot = isSnapshotMeta(body.snapshot) ? body.snapshot : null;
-    return { ladder: body.ladder, snapshot };
+    const liveError = typeof body.liveError === "string" && body.liveError !== "" ? body.liveError : null;
+    return { ladder: body.ladder, snapshot, liveError };
   } catch (error) {
     if (error instanceof ApiError || signal?.aborted === true) {
       throw error;

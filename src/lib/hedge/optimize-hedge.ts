@@ -702,6 +702,10 @@ function cheapestPlanMeeting(context: SolveContext, target: number, maxOutlay: n
         outlayMargin = Math.max(outlayMargin, context.roundingBound);
       }
     }
+    // Stage 1 minimises the same cost it bounds here, so this bound can only make the
+    // program infeasible sooner (a bound at or above the optimum changes nothing beyond ties).
+    // The never-over-the-limit guarantee does not rest on it: it rests on the post-rounding
+    // overrun check below and on the affordable maximin fallback (`affordableMaximinLegs`).
     const maxCost = maxOutlay === null ? null : maxOutlay - outlayMargin;
     const quantities = solveMinimumCost(context.candidates, context.unhedged, target + margin, maxCost);
     if (quantities === null) {

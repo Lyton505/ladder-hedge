@@ -1,5 +1,10 @@
 import type { HedgePlan, HedgeStatus } from "@/lib/hedge/types";
-import { classifyMaxHedgeable, costFigures, type CashLimitNote } from "@/lib/client/workbench-model";
+import {
+  bestEffortExplanation,
+  classifyMaxHedgeable,
+  costFigures,
+  type CashLimitNote,
+} from "@/lib/client/workbench-model";
 import {
   formatCountdown,
   formatLocalDateTime,
@@ -51,6 +56,13 @@ export interface PlanStatsProps {
    * null when no limit is set or it does not change the plan.
    */
   cashLimit?: CashLimitNote | null;
+  /**
+   * For a `best-effort` plan, the best worst case any basket could reach within the same
+   * limits, before rounding (`bestAchievableWorstCase`); null when not computed or unknown.
+   */
+  bestReachableWorstCase?: number | null;
+  /** The cash limit in dollars the plan was computed with, or null when none is set. */
+  maxOutlay?: number | null;
 }
 
 /** Plain-language headline and explanation for each plan status. */
@@ -59,20 +71,50 @@ interface StatusCopy {
   body: string;
 }
 
+/** Figures the best-effort explanation needs beyond the plan itself. */
+interface BestEffortContext {
+  /** Best worst case reachable within the current limits, or null when unknown. */
+  bestReachable: number | null;
+  /** Position value in dollars. */
+  positionValue: number;
+  /** Cash limit in dollars, or null when none is set. */
+  maxOutlay: number | null;
+}
+
+/**
+ * Explains a `best-effort` plan with its own figures (see `bestEffortExplanation`).
+ *
+ * @param {HedgePlan} plan - The `best-effort` plan.
+ * @param {BestEffortContext} context - Best reachable worst case, position value and cash limit.
+ * @returns {string} The explanation.
+ */
+function explainBestEffort(plan: HedgePlan, context: BestEffortContext): string {
+  return bestEffortExplanation({
+    floor: -plan.requestedMaxLoss,
+    worstCaseBefore: plan.worstCaseBefore,
+    worstCaseAfter: plan.worstCaseAfter,
+    bestReachable: context.bestReachable,
+    positionValue: context.positionValue,
+    cashLimit: context.maxOutlay,
+  });
+}
+
 /**
  * Builds the headline and explanation for a plan that falls short of the floor while a
- * cash limit binds. It never implies the limited plan meets the floor.
+ * cash limit binds. It never implies the limited plan meets the floor, nor that it is the
+ * best possible.
  *
  * @param {HedgePlan} plan - The plan computed within the limit (`best-effort` or `unhedgeable`).
  * @param {CashLimitNote} note - Why it falls short.
+ * @param {BestEffortContext} context - Figures for the best-effort explanation.
  * @returns {StatusCopy} Headline and explanation.
  */
-function cashLimitCopy(plan: HedgePlan, note: CashLimitNote): StatusCopy {
+function cashLimitCopy(plan: HedgePlan, note: CashLimitNote, context: BestEffortContext): StatusCopy {
   const floor = formatUsd(-plan.requestedMaxLoss);
   const limit = formatUsd(note.maxOutlay);
   const within =
     plan.status === "best-effort"
-      ? `This plan is the best protection within the limit: it lifts the worst case to ${formatUsd(plan.worstCaseAfter)}, short of the floor.`
+      ? explainBestEffort(plan, { ...context, maxOutlay: note.maxOutlay })
       : "Nothing within the limit improves your worst case, so there is nothing to buy.";
   switch (note.kind) {
     case "needs-more-cash":
@@ -83,7 +125,7 @@ function cashLimitCopy(plan: HedgePlan, note: CashLimitNote): StatusCopy {
     case "floor-unreachable":
       return {
         title: "Floor out of reach",
-        body: `No basket on this ladder holds every price range at ${floor}, at any price: the best it can reach is ${formatUsd(note.unlimitedWorstCase)}, for ${formatUsd(note.unlimitedOutlay)} up front. Your cash limit is ${limit}. ${within}`,
+        body: `The engine found no basket on this ladder that holds every price range at ${floor}, at any price: with no cash limit, the basket it picks reaches ${formatUsd(note.unlimitedWorstCase)} and costs ${formatUsd(note.unlimitedOutlay)} up front. Your cash limit is ${limit}. ${within}`,
       };
     case "unknown":
       return {
@@ -99,23 +141,29 @@ function cashLimitCopy(plan: HedgePlan, note: CashLimitNote): StatusCopy {
  * @param {HedgeStatus} status - The plan status.
  * @param {HedgePlan} plan - The plan, for figures used in the copy.
  * @param {CashLimitNote | null} cashLimit - Why the plan falls short when a cash limit binds, or null.
+ * @param {BestEffortContext} context - Figures for the best-effort explanation.
  * @returns {StatusCopy} Headline and explanation.
  */
-function statusCopy(status: HedgeStatus, plan: HedgePlan, cashLimit: CashLimitNote | null): StatusCopy {
+function statusCopy(
+  status: HedgeStatus,
+  plan: HedgePlan,
+  cashLimit: CashLimitNote | null,
+  context: BestEffortContext,
+): StatusCopy {
   const floor = formatUsd(-plan.requestedMaxLoss);
   if (cashLimit !== null && (status === "best-effort" || status === "unhedgeable")) {
-    return cashLimitCopy(plan, cashLimit);
+    return cashLimitCopy(plan, cashLimit, context);
   }
   switch (status) {
     case "optimal":
       return {
         title: "Floor met",
-        body: `This is the lowest-cost basket that keeps every price range at or above your floor of ${floor} at expiry.`,
+        body: `This is the lowest-cost basket found that keeps every price range at or above your floor of ${floor} at expiry, after rounding to tradable sizes and fees.`,
       };
     case "best-effort":
       return {
         title: "Floor out of reach",
-        body: `The quoted contracts and depth cannot hold every price range at ${floor}. This basket lifts the worst case as far as the quotes allow, to ${formatUsd(plan.worstCaseAfter)}.`,
+        body: `The engine found no basket of these quotes and depth that holds every price range at ${floor}. ${explainBestEffort(plan, context)}`,
       };
     case "no-hedge-needed":
       return {
@@ -225,6 +273,8 @@ function LossScale({ before, after, floor }: { before: number; after: number; fl
  * @param {React.ReactNode} [props.chartSlot] - Content shown under the headline figures.
  * @param {string | null} [props.emptyMessage] - Text shown in place of the plan when there is none and nothing is loading.
  * @param {CashLimitNote | null} [props.cashLimit] - Why the plan falls short of the floor when a cash limit binds.
+ * @param {number | null} [props.bestReachableWorstCase] - Best worst case reachable within the current limits, for a `best-effort` plan.
+ * @param {number | null} [props.maxOutlay] - Cash limit in dollars the plan was computed with, or null.
  * @returns {JSX.Element} The summary.
  */
 export function PlanStats({
@@ -243,6 +293,8 @@ export function PlanStats({
   depthNote = null,
   emptyMessage = null,
   cashLimit = null,
+  bestReachableWorstCase = null,
+  maxOutlay = null,
 }: PlanStatsProps) {
   if (error !== null && error !== "") {
     return (
@@ -278,7 +330,11 @@ export function PlanStats({
     );
   }
 
-  const copy = statusCopy(plan.status, plan, cashLimit);
+  const copy = statusCopy(plan.status, plan, cashLimit, {
+    bestReachable: bestReachableWorstCase,
+    positionValue,
+    maxOutlay,
+  });
   const costShare = positionValue > 0 ? plan.totalCost / positionValue : Number.NaN;
   // Rounded to the cent as shown, so net always reads as paid minus expected.
   const figures = costFigures(plan.totalCost, plan.expectedHedgePayout);

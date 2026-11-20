@@ -4,8 +4,14 @@ import { isRecord, parseDecimal } from "@/lib/gemini/parse-ladder";
 /** Base URL of Gemini's public REST API. No API key is needed for the endpoints used here. */
 export const GEMINI_API_BASE = "https://api.gemini.com";
 
-/** Every Gemini request is abandoned after this many milliseconds. */
+/** Every Gemini request is abandoned after this many milliseconds, except the events list. */
 export const GEMINI_TIMEOUT_MS = 8000;
+
+/**
+ * Timeout for one page of the events list. The page is about 555 KB and the timeout
+ * covers reading the body; measured calls took 0.96 to 7.31 s, too close to 8 s.
+ */
+export const GEMINI_LIST_TIMEOUT_MS = 15_000;
 
 /** Page size for the events endpoint; Gemini accepts up to 500. */
 const EVENTS_PAGE_SIZE = 500;
@@ -77,22 +83,23 @@ export function normalizeAsset(asset: string): string {
  * Performs a GET against the Gemini API and parses the JSON body.
  *
  * @param {string} path - Path and query, starting with "/".
+ * @param {number} [timeoutMs] - Time allowed for the request and the body read. Defaults to GEMINI_TIMEOUT_MS.
  * @returns {Promise<unknown>} The parsed, still untrusted, JSON body.
  * @throws {GeminiError} On timeout, network failure, a non-2xx status, or a body that is not JSON.
  */
-async function getJson(path: string): Promise<unknown> {
+async function getJson(path: string, timeoutMs: number = GEMINI_TIMEOUT_MS): Promise<unknown> {
   const url = `${GEMINI_API_BASE}${path}`;
   let response: Response;
   try {
     response = await fetch(url, {
       cache: "no-store",
       headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
     const isTimeout = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
     if (isTimeout) {
-      throw new GeminiError("timeout", `Gemini did not answer within ${GEMINI_TIMEOUT_MS} ms: ${path}`, null, error);
+      throw new GeminiError("timeout", `Gemini did not answer within ${timeoutMs} ms: ${path}`, null, error);
     }
     throw new GeminiError("network", `Could not reach Gemini: ${path}`, null, error);
   }
@@ -101,6 +108,10 @@ async function getJson(path: string): Promise<unknown> {
   try {
     text = await response.text();
   } catch (error) {
+    const isTimeout = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
+    if (isTimeout) {
+      throw new GeminiError("timeout", `Gemini response body did not arrive within ${timeoutMs} ms: ${path}`, response.status, error);
+    }
     throw new GeminiError("network", `Gemini response body could not be read: ${path}`, response.status, error);
   }
 
@@ -121,7 +132,7 @@ async function getJson(path: string): Promise<unknown> {
 /**
  * Fetches every active event in Gemini's crypto category, paging until the reported total.
  * The `category=crypto` filter is verified to return only events with `category: "Crypto"`;
- * callers still check the category of each event.
+ * callers still check the category of each event. Each page gets GEMINI_LIST_TIMEOUT_MS.
  *
  * @returns {Promise<unknown[]>} Raw, untrusted event objects (ladders and binary up/down events).
  * @throws {GeminiError} When any page fails or has an unexpected shape.
@@ -133,6 +144,7 @@ export async function fetchActiveCryptoEvents(): Promise<unknown[]> {
       const offset = page * EVENTS_PAGE_SIZE;
       const body = await getJson(
         `/v1/prediction-markets/events?status=active&category=crypto&limit=${EVENTS_PAGE_SIZE}&offset=${offset}`,
+        GEMINI_LIST_TIMEOUT_MS,
       );
       if (!isRecord(body) || !Array.isArray(body.data)) {
         throw new GeminiError("invalid-response", "Gemini events response has no data array");

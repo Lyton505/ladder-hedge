@@ -73,6 +73,11 @@ export function useHedgeReceipts(): HedgeReceiptsState {
     };
   }, [connection, publicKey, requestKey]);
 
+  /**
+   * Reads the wallet's receipts from chain again.
+   *
+   * @returns {void}
+   */
   const refresh = useCallback((): void => {
     setRefreshCount((count) => count + 1);
   }, []);

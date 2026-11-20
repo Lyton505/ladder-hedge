@@ -28,7 +28,9 @@ export function defaultStressPrice(ladder: Ladder): number {
  *
  * A supplied stress price is used as given. Otherwise the stress price is the
  * lower of `defaultStressPrice(ladder)` and one median strike gap below spot,
- * with the spot term never below zero (a price cannot go negative).
+ * never below zero (a price cannot go negative): the spot term is clamped, and so
+ * is the result, because the lowest strike minus the median gap can be negative
+ * on its own when the lowest strike is below the gap.
  * The second term matters when spot is already below the ladder: without it
  * every evaluation price would sit above spot and the holder would wrongly
  * appear to gain in every state.
@@ -36,7 +38,7 @@ export function defaultStressPrice(ladder: Ladder): number {
  * @param {Ladder} ladder - The ladder, rungs sorted ascending by strike.
  * @param {Exposure} exposure - The holding; only its spot is used.
  * @param {number | null} stressPrice - The requested stress price, or null for the default.
- * @returns {number} The stress price to pass to `buildPriceStates`.
+ * @returns {number} The stress price to pass to `buildPriceStates`; never negative when defaulted.
  * @throws {RangeError} If the ladder has no rungs.
  */
 export function resolveStressPrice(ladder: Ladder, exposure: Exposure, stressPrice: number | null): number {
@@ -45,7 +47,7 @@ export function resolveStressPrice(ladder: Ladder, exposure: Exposure, stressPri
   }
   const strikes = ladder.rungs.map((rung) => rung.strike);
   const spotTerm = Math.max(0, exposure.spot - medianStrikeGap(strikes));
-  return Math.min(defaultStressPrice(ladder), spotTerm);
+  return Math.max(0, Math.min(defaultStressPrice(ladder), spotTerm));
 }
 
 /**

@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { HedgePlan, Ladder, LadderSummary, PaperFill } from "@/lib/hedge/types";
+import type { HedgeLeg, HedgePlan, HedgeRequest, Ladder, LadderSummary, PaperFill } from "@/lib/hedge/types";
 import { SOL_FIXTURE_LADDER } from "@/lib/hedge/test-fixtures";
-import { optimizeHedge } from "@/lib/hedge";
+import { bestAchievableWorstCase, optimizeHedge } from "@/lib/hedge";
 import { SOL_FIXTURE_EXPOSURE } from "@/lib/hedge/test-fixtures";
 import { formatUsd } from "@/components/format";
 import {
+  bestEffortExplanation,
   cashLimitNote,
   chooseDefaultLadder,
   classifyMaxHedgeable,
@@ -14,7 +15,7 @@ import {
   countTwoSidedRungs,
   ladderDepthBasis,
   ladderHorizon,
-  matchVerifiedSignatures,
+  matchReceipts,
   planDepthBasis,
   spotPosition,
   spotPositionNotice,
@@ -110,7 +111,15 @@ describe("depth basis", () => {
         rung.strike === 72 ? { ...rung, yesBidSize: 25, yesAskSize: null } : rung,
       ),
     };
-    const legAt = (strike: number, side: "yes" | "no") => {
+    /**
+     * Builds a one-contract leg on a rung of the sized ladder.
+     *
+     * @param {number} strike - The rung's strike.
+     * @param {"yes" | "no"} side - The side bought.
+     * @returns {HedgeLeg} The leg.
+     * @throws {Error} When the ladder has no rung at that strike.
+     */
+    const legAt = (strike: number, side: "yes" | "no"): HedgeLeg => {
       const rung = sized.rungs.find((candidate) => candidate.strike === strike);
       if (rung === undefined) {
         throw new Error(`no rung ${strike}`);
@@ -230,7 +239,7 @@ describe("spotPositionNotice", () => {
   });
 });
 
-describe("matchVerifiedSignatures", () => {
+describe("matchReceipts", () => {
   const plan: HedgePlan = {
     status: "optimal",
     legs: [],
@@ -254,14 +263,134 @@ describe("matchVerifiedSignatures", () => {
     signature: "sig-1",
   };
 
-  it("matches receipts by ticker and hash prefix, ignoring unrelated memos", () => {
+  const memoA = `LH1|SOL2611202200|q=10|floor=10|cost=2.40|legs=0|h=${"a".repeat(32)}`;
+
+  it("verifies a receipt only when the fill recorded that signature and the memo matches it", () => {
     const receipts = [
-      { signature: "sig-1", memo: `LH1|SOL2611202200|q=10|floor=10|cost=2.40|legs=0|h=${"a".repeat(32)}`, blockTime: null, slot: 2 },
+      { signature: "sig-1", memo: memoA, blockTime: null, slot: 2 },
       { signature: "sig-2", memo: `LH1|SOL2611202200|q=10|floor=10|cost=2.40|legs=0|h=${"b".repeat(32)}`, blockTime: null, slot: 1 },
       { signature: "sig-3", memo: `LH1|BTC2611202200|q=10|floor=10|cost=2.40|legs=0|h=${"a".repeat(32)}`, blockTime: null, slot: 0 },
       { signature: "sig-4", memo: "hello", blockTime: null, slot: 0 },
     ];
-    expect(matchVerifiedSignatures([fill], receipts)).toEqual(["sig-1"]);
+    expect(matchReceipts([fill], receipts)).toEqual({ verified: ["sig-1"], unrecorded: [] });
+  });
+
+  it("does not verify a copied memo sent in another transaction, and reports it as unrecorded", () => {
+    // A forger copies the public memo, edits q= and cost=, and sends it in a transaction
+    // that mentions the wallet: same ticker and hash prefix, different signature.
+    const forged = { signature: "sig-forged", memo: memoA.replace("q=10", "q=999").replace("cost=2.40", "cost=0.01"), blockTime: null, slot: 3 };
+    expect(matchReceipts([fill], [forged])).toEqual({ verified: [], unrecorded: ["sig-forged"] });
+    // The same holds when the fill has no signature yet.
+    expect(matchReceipts([{ ...fill, signature: null }], [{ ...forged, memo: memoA }])).toEqual({
+      verified: [],
+      unrecorded: ["sig-forged"],
+    });
+  });
+
+  it("does not verify a recorded signature whose memo names another plan", () => {
+    const receipt = { signature: "sig-1", memo: `LH1|SOL2611202200|q=10|floor=10|cost=2.40|legs=0|h=${"c".repeat(32)}`, blockTime: null, slot: 2 };
+    expect(matchReceipts([fill], [receipt])).toEqual({ verified: [], unrecorded: [] });
+  });
+});
+
+describe("bestEffortExplanation", () => {
+  /**
+   * Builds the fee-0.07 fixture request (10 SOL, unlimited depth) with a given floor.
+   *
+   * @param {number} maxLoss - Loss floor in dollars.
+   * @param {number | null} maxOutlay - Cash limit in dollars, or null.
+   * @returns {HedgeRequest} The request.
+   */
+  const requestWith = (maxLoss: number, maxOutlay: number | null): HedgeRequest => ({
+    ladder: SOL_FIXTURE_LADDER,
+    exposure: SOL_FIXTURE_EXPOSURE,
+    maxLoss,
+    stressPrice: null,
+    takerFeeRate: 0.07,
+    assumedDepth: null,
+    maxOutlay,
+  });
+
+  it("states the best reachable worst case, this basket's worst case and why it stops short", () => {
+    // A $0 floor is out of reach on the fixture.
+    const request = requestWith(0, null);
+    const plan = optimizeHedge(request);
+    expect(plan.status).toBe("best-effort");
+    const best = bestAchievableWorstCase(request);
+    expect(best).toBeLessThan(0);
+    expect(best).toBeGreaterThanOrEqual(plan.worstCaseAfter);
+    const text = bestEffortExplanation({
+      floor: 0,
+      worstCaseBefore: plan.worstCaseBefore,
+      worstCaseAfter: plan.worstCaseAfter,
+      bestReachable: best,
+      positionValue: 721.2,
+      cashLimit: null,
+    });
+    expect(text).toContain(`The best worst case any basket of these quotes could reach is ${formatUsd(best)}.`);
+    expect(text).toContain(`This basket reaches ${formatUsd(plan.worstCaseAfter)}`);
+    expect(text).toContain("on purpose: the last part of the protection costs disproportionately more");
+    expect(text).toContain("the smaller of 0.1% of the position's value and 5% of the improvement over no hedge");
+    expect(text).toContain("a slightly looser floor that can be met may show a better worst case");
+    expect(text).not.toMatch(/as far as|best possible|best it can reach|best protection/i);
+  });
+
+  it("names the cash limit when the best reachable worst case is within one", () => {
+    const request = requestWith(10, 1.5);
+    const plan = optimizeHedge(request);
+    expect(plan.status).toBe("best-effort");
+    const best = bestAchievableWorstCase(request);
+    const text = bestEffortExplanation({
+      floor: -10,
+      worstCaseBefore: plan.worstCaseBefore,
+      worstCaseAfter: plan.worstCaseAfter,
+      bestReachable: best,
+      positionValue: 721.2,
+      cashLimit: 1.5,
+    });
+    expect(text).toContain(`could reach within your cash limit of $1.50 is ${formatUsd(best)}.`);
+    expect(text).toContain(`This basket reaches ${formatUsd(plan.worstCaseAfter)}`);
+  });
+
+  it("explains a floor reachable only before rounding without calling it out of reach before rounding", () => {
+    const text = bestEffortExplanation({
+      floor: -10.55,
+      worstCaseBefore: -80,
+      worstCaseAfter: -11.27,
+      bestReachable: -10.44,
+      positionValue: 727.47,
+      cashLimit: null,
+    });
+    expect(text).toContain("Before rounding, a basket could reach -$10.44, which meets your floor");
+    expect(text).toContain("This basket reaches -$11.27, $0.83 short of -$10.44");
+    expect(text).toContain("rounding causes part of the gap");
+  });
+
+  it("does not claim the gap is all deliberate when it is wider than the allowance", () => {
+    const text = bestEffortExplanation({
+      floor: -5,
+      worstCaseBefore: -80,
+      worstCaseAfter: -12,
+      bestReachable: -10,
+      positionValue: 700,
+      cashLimit: null,
+    });
+    expect(text).toContain("$2.00 short of that.");
+    expect(text).not.toContain("on purpose:");
+    expect(text).toContain("Rounding to tradable sizes and cent fees can cause part of the gap");
+  });
+
+  it("still explains the shortfall when the best reachable worst case is unknown", () => {
+    const text = bestEffortExplanation({
+      floor: -5,
+      worstCaseBefore: -80,
+      worstCaseAfter: -12,
+      bestReachable: null,
+      positionValue: 700,
+      cashLimit: null,
+    });
+    expect(text).toContain("This basket reaches -$12.00. It stops short of the best reachable worst case on purpose");
+    expect(text).not.toContain("NaN");
   });
 });
 
