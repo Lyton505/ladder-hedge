@@ -204,10 +204,10 @@ Rounding and cent fees can push the worst case below the floor. When that happen
 |---|---|
 | `optimal` | The floor is met; the plan is the lowest-cost basket found after rounding to tradable sizes and fees. |
 | `best-effort` | The floor cannot be met with the quoted legs and depth, or not within the cash limit. The plan deliberately stops short of the best reachable worst case: it is the cheapest basket whose worst case is within the smaller of 0.1% of position value and 5% of the improvement over no hedge of that best figure, because the last part of the protection costs disproportionately more. |
-
-For a `best-effort` plan the page states three things: the best worst case any basket could reach within the current limits (`bestAchievableWorstCase` on the same request, cash limit included, before rounding), the worst case this basket reaches, and why it stops short. Because of the allowance, tightening the floor past what is reachable can show a slightly worse worst case than a looser floor that is met (on the live SOL daily ladder in review: a 1.50% floor gave "Floor met" at -$10.91, and 1.45% gave "Floor out of reach" at -$11.27); the page says so in one sentence when a plan is `best-effort`.
 | `no-hedge-needed` | The unhedged worst case already meets the floor. No legs. Does not depend on the cash limit. |
 | `unhedgeable` | No available leg, or none affordable within the cash limit, improves the worst case. No legs. |
+
+For a `best-effort` plan the page states three things: the best worst case any basket could reach within the current limits (`bestAchievableWorstCase` on the same request, cash limit included, before rounding), the worst case this basket reaches, and why it stops short. Because of the allowance, tightening the floor past what is reachable can show a slightly worse worst case than a looser floor that is met (on the live SOL daily ladder in review: a 1.50% floor gave "Floor met" at -$10.91, and 1.45% gave "Floor out of reach" at -$11.27); the page says so in one sentence when a plan is `best-effort`.
 
 ### Largest hedgeable position
 
